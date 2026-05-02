@@ -3,6 +3,8 @@ services:
     image: thetonbr/rinha-zig-2026:latest
     expose:
       - "8080"
+    security_opt:
+      - seccomp:unconfined
     deploy:
       resources:
         limits:
@@ -15,6 +17,8 @@ services:
     image: thetonbr/rinha-zig-2026:latest
     expose:
       - "8080"
+    security_opt:
+      - seccomp:unconfined
     deploy:
       resources:
         limits:
