@@ -1,6 +1,6 @@
 services:
   api1:
-    image: thetonbr/rinha-zig-2026:latest
+    image: thetonbr/rinha-zig-2026:v2
     expose:
       - "8080"
     security_opt:
@@ -14,7 +14,7 @@ services:
       - rinha-net
 
   api2:
-    image: thetonbr/rinha-zig-2026:latest
+    image: thetonbr/rinha-zig-2026:v2
     expose:
       - "8080"
     security_opt:
