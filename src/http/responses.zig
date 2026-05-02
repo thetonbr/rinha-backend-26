@@ -2,6 +2,12 @@ const std = @import("std");
 
 pub const Response = struct { bytes: []const u8 };
 
+// Successful responses use `Connection: keep-alive` so HAProxy can pool the
+// backend Unix socket across many client requests. Without this, every
+// front-end request opens and closes a fresh backend socket, which dominates
+// latency under sustained QPS (TIME_WAIT exhaustion + per-request connect
+// overhead). 4xx errors keep `Connection: close` because they signal a
+// malformed client and we want them to drop immediately.
 pub const fraud: [6]Response = blk: {
     var arr: [6]Response = undefined;
     for (0..6) |i| {

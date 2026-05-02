@@ -2,6 +2,7 @@
 docs/
 bench/
 test/
+docker-compose.bench.yml
 
 # CI — not used
 .github/

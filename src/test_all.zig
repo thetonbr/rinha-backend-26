@@ -9,9 +9,8 @@ test {
     _ = @import("index/format.zig");
     _ = @import("index/ivf.zig");
     _ = @import("index/loader.zig");
-    _ = @import("io/uring.zig");
     _ = @import("io/conn.zig");
-    _ = @import("http/server.zig");
+    _ = @import("io/epoll.zig");
     // build_index/parser.zig lives outside src/'s module path and is exercised
     // separately via `zig test build_index/parser.zig` (it is a build-time
     // tool, not part of the api binary).
