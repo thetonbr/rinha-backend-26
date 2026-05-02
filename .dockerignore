@@ -1,0 +1,10 @@
+.git
+docs
+bench
+test
+.github
+zig-cache
+zig-out
+.zig-cache
+*.md
+!README.md
