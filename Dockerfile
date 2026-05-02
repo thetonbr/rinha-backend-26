@@ -41,7 +41,7 @@ RUN ls -la zig-out/bin/api zig-out/bin/build_index
 # ---------------------------------------------------------------------------
 FROM zig AS index-builder
 ARG REFS_URL=https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main/resources/references.json.gz
-ARG NLIST=2048
+ARG NLIST=256
 WORKDIR /work
 COPY --from=builder /src/zig-out/bin/build_index /usr/local/bin/build_index
 RUN curl -fsSL -o /tmp/refs.json.gz "${REFS_URL}" \
