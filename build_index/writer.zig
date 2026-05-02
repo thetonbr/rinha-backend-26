@@ -1,18 +1,22 @@
-//! Build-time writer for the binary IVF index (`index.bin`).
+//! Build-time writer for the V2 binary IVF index (`index.bin`).
 //!
 //! Layout (little-endian, x86_64):
 //!
-//!   [Header                      ] 64 bytes
-//!   [centroids: nlist × 16 × f32 ]
-//!   [invlist_offsets: (nlist+1) × u32]
-//!   [pad to VECTORS_BLOCK_ALIGN  ] 0..63 bytes of zeros
-//!   [vectors_q_sorted: n × 16 × i16] aligned to 64 bytes
-//!   [fraud_bits: ⌈n/8⌉ bytes     ]
+//!   [Header                                  ] 64 bytes
+//!   [centroids: nlist × 16 × f32             ]
+//!   [invlist_offsets: (nlist+1) × u32        ]
+//!   [bbox_min: nlist × 14 × i16              ]
+//!   [bbox_max: nlist × 14 × i16              ]
+//!   [pad to BLOCK_ALIGN                      ]
+//!   [orig_ids: n_vectors × u32               ] aligned to 64 bytes
+//!   [pad to BLOCK_ALIGN] [dim0: n × i16      ] aligned to 64 bytes
+//!   ... 14 dim blocks total ...
+//!   [pad to BLOCK_ALIGN] [dim13: n × i16     ] aligned to 64 bytes
+//!   [fraud_bits: ⌈n/8⌉ bytes                 ]
 //!
-//! The padding before the vectors block is mandatory: the runtime loader
-//! exposes that block as `[]align(64) const i16` so AVX2 ymm loads are valid,
-//! and `loader.load` skips bytes via `alignForward`. If the writer omits the
-//! padding the offsets desynchronise and the index is corrupt.
+//! Padding before each aligned block is mandatory: the runtime loader exposes
+//! orig_ids and each dim as `[]align(64) const T` for AVX2. Without padding
+//! the offsets desynchronise and the index is unreadable.
 
 const std = @import("std");
 // `fmt` is exposed as a named module by build.zig (and by the standalone
@@ -28,18 +32,36 @@ pub const Args = struct {
     n_vectors: u32,
     /// Number of inverted lists (must match `centroids_padded.len`).
     nlist: u32,
-    /// nlist centroids, each padded from 14 → 16 f32 lanes.
+    /// nlist centroids, each padded from 14 → 16 f32 lanes (lanes 14/15 zero).
     centroids_padded: [][16]f32,
-    /// nlist + 1 prefix-sum offsets into `vectors_q_sorted`.
+    /// nlist + 1 prefix-sum offsets into the per-dim arrays.
     invlist_offsets: []u32,
-    /// n_vectors quantized vectors, sorted so each invlist is contiguous.
-    vectors_q_sorted: [][16]i16,
-    /// Bitset (LSB-first within each byte) flagging fraud labels per vector.
+    /// nlist × 14 i16 minimum coordinates per cluster (axis-aligned bbox).
+    bbox_min: [][fmt.DIM]i16,
+    /// nlist × 14 i16 maximum coordinates per cluster.
+    bbox_max: [][fmt.DIM]i16,
+    /// n_vectors original-dataset positions, in invlist-sorted order. Used as
+    /// the deterministic tie-break key in the runtime top-5.
+    orig_ids: []u32,
+    /// dims[j][i] = quantized i16 value of dim j for the i-th invlist-sorted
+    /// vector. The 14 arrays are written contiguously, each aligned to 64.
+    dims: [fmt.DIM][]i16,
+    /// Bitset (LSB-first within each byte) flagging fraud labels per vector,
+    /// in the same invlist-sorted order as `orig_ids` and `dims`.
     fraud_bits: []u8,
 };
 
-/// Emit `index.bin` at `args.out_path` according to the layout above.
+/// Emit `index.bin` at `args.out_path` according to the V2 layout above.
 pub fn write(args: Args) !void {
+    std.debug.assert(args.centroids_padded.len == args.nlist);
+    std.debug.assert(args.invlist_offsets.len == args.nlist + 1);
+    std.debug.assert(args.bbox_min.len == args.nlist);
+    std.debug.assert(args.bbox_max.len == args.nlist);
+    std.debug.assert(args.orig_ids.len == args.n_vectors);
+    inline for (0..fmt.DIM) |j| {
+        std.debug.assert(args.dims[j].len == args.n_vectors);
+    }
+
     const f = try std.fs.createFileAbsolute(args.out_path, .{ .truncate = true });
     defer f.close();
     var bw = std.io.bufferedWriter(f.writer());
@@ -50,27 +72,46 @@ pub fn write(args: Args) !void {
         .version = fmt.VERSION,
         .n_vectors = args.n_vectors,
         .dim = fmt.DIM,
-        .dim_padded = fmt.DIM_PADDED,
         .nlist = args.nlist,
         .scale = fmt.SCALE,
-        .reserved = std.mem.zeroes([36]u8),
+        .reserved = std.mem.zeroes([40]u8),
     };
     try w.writeAll(std.mem.asBytes(&hdr));
     try w.writeAll(std.mem.sliceAsBytes(args.centroids_padded));
     try w.writeAll(std.mem.sliceAsBytes(args.invlist_offsets));
+    try w.writeAll(std.mem.sliceAsBytes(args.bbox_min));
+    try w.writeAll(std.mem.sliceAsBytes(args.bbox_max));
 
-    // Pad to VECTORS_BLOCK_ALIGN (64) so the vectors block starts on a 64-byte
-    // boundary; the loader expects to read it as []align(64) const i16 for
-    // AVX2. Without this the vectors block lands on the wrong offset and the
-    // index is unreadable.
-    const written: usize = @sizeOf(fmt.Header) + args.centroids_padded.len * @sizeOf([16]f32) + args.invlist_offsets.len * @sizeOf(u32);
-    const aligned: usize = std.mem.alignForward(usize, written, fmt.VECTORS_BLOCK_ALIGN);
-    if (aligned > written) {
-        const pad = [_]u8{0} ** fmt.VECTORS_BLOCK_ALIGN;
-        try w.writeAll(pad[0 .. aligned - written]);
+    var off: usize =
+        @sizeOf(fmt.Header) +
+        args.centroids_padded.len * @sizeOf([16]f32) +
+        args.invlist_offsets.len * @sizeOf(u32) +
+        args.bbox_min.len * @sizeOf([fmt.DIM]i16) * 2;
+
+    // Pad before orig_ids so it starts on a 64-byte boundary.
+    {
+        const aligned: usize = std.mem.alignForward(usize, off, fmt.BLOCK_ALIGN);
+        if (aligned > off) {
+            const pad = [_]u8{0} ** fmt.BLOCK_ALIGN;
+            try w.writeAll(pad[0 .. aligned - off]);
+        }
+        off = aligned;
+    }
+    try w.writeAll(std.mem.sliceAsBytes(args.orig_ids));
+    off += args.orig_ids.len * @sizeOf(u32);
+
+    // 14 dim blocks each aligned to 64 bytes.
+    inline for (0..fmt.DIM) |j| {
+        const aligned: usize = std.mem.alignForward(usize, off, fmt.BLOCK_ALIGN);
+        if (aligned > off) {
+            const pad = [_]u8{0} ** fmt.BLOCK_ALIGN;
+            try w.writeAll(pad[0 .. aligned - off]);
+        }
+        off = aligned;
+        try w.writeAll(std.mem.sliceAsBytes(args.dims[j]));
+        off += args.dims[j].len * @sizeOf(i16);
     }
 
-    try w.writeAll(std.mem.sliceAsBytes(args.vectors_q_sorted));
     try w.writeAll(args.fraud_bits);
 
     try bw.flush();
@@ -80,33 +121,47 @@ pub fn write(args: Args) !void {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "writer emits a roundtrippable binary index" {
+test "writer emits a roundtrippable V2 binary index" {
     const allocator = std.testing.allocator;
 
-    const tmp_path = "/tmp/rinha2026_writer_test_index.bin";
+    const tmp_path = "/tmp/rinha2026_writer_test_index_v2.bin";
     defer std.fs.deleteFileAbsolute(tmp_path) catch {};
 
-    // Two centroids, two invlists, eight vectors. Use distinguishable values
-    // so we can pinpoint mis-offsets by inspecting the raw bytes.
-    const centroids = try allocator.alloc([16]f32, 2);
+    const n_vectors: u32 = 8;
+    const nlist: u32 = 2;
+
+    const centroids = try allocator.alloc([16]f32, nlist);
     defer allocator.free(centroids);
     for (centroids, 0..) |*c, i| {
         c.* = .{0} ** 16;
         c[0] = @floatFromInt(i + 1);
     }
 
-    var offsets = try allocator.alloc(u32, 3);
+    var offsets = try allocator.alloc(u32, nlist + 1);
     defer allocator.free(offsets);
     offsets[0] = 0;
     offsets[1] = 4;
     offsets[2] = 8;
 
-    const vectors = try allocator.alloc([16]i16, 8);
-    defer allocator.free(vectors);
-    for (vectors, 0..) |*v, i| {
-        v.* = .{0} ** 16;
-        v[0] = @intCast(i + 100);
+    const bbox_min = try allocator.alloc([fmt.DIM]i16, nlist);
+    defer allocator.free(bbox_min);
+    const bbox_max = try allocator.alloc([fmt.DIM]i16, nlist);
+    defer allocator.free(bbox_max);
+    for (bbox_min, bbox_max) |*lo, *hi| {
+        lo.* = .{0} ** fmt.DIM;
+        hi.* = .{0} ** fmt.DIM;
     }
+
+    const orig_ids = try allocator.alloc(u32, n_vectors);
+    defer allocator.free(orig_ids);
+    for (orig_ids, 0..) |*o, i| o.* = @intCast(100 + i);
+
+    var dims_storage: [fmt.DIM][]i16 = undefined;
+    inline for (0..fmt.DIM) |j| {
+        dims_storage[j] = try allocator.alloc(i16, n_vectors);
+        for (dims_storage[j], 0..) |*v, i| v.* = @intCast(j * 100 + i);
+    }
+    defer inline for (0..fmt.DIM) |j| allocator.free(dims_storage[j]);
 
     var fraud_bits = try allocator.alloc(u8, 1);
     defer allocator.free(fraud_bits);
@@ -114,50 +169,53 @@ test "writer emits a roundtrippable binary index" {
 
     try write(.{
         .out_path = tmp_path,
-        .n_vectors = 8,
-        .nlist = 2,
+        .n_vectors = n_vectors,
+        .nlist = nlist,
         .centroids_padded = centroids,
         .invlist_offsets = offsets,
-        .vectors_q_sorted = vectors,
+        .bbox_min = bbox_min,
+        .bbox_max = bbox_max,
+        .orig_ids = orig_ids,
+        .dims = dims_storage,
         .fraud_bits = fraud_bits,
     });
 
-    // Read the file back and validate the layout manually (we cannot import
-    // src/index/loader.zig from this module — Zig 0.13 forbids `..` paths).
+    // Read back and validate the layout manually (we cannot import the loader
+    // from build_index/ — Zig 0.13 forbids `..` paths).
     const data = try std.fs.cwd().readFileAlloc(allocator, tmp_path, 1 << 20);
     defer allocator.free(data);
 
-    // Header.
     const hdr: *const fmt.Header = @ptrCast(@alignCast(data.ptr));
     try std.testing.expectEqual(fmt.MAGIC, hdr.magic);
     try std.testing.expectEqual(fmt.VERSION, hdr.version);
-    try std.testing.expectEqual(@as(u32, 8), hdr.n_vectors);
+    try std.testing.expectEqual(n_vectors, hdr.n_vectors);
     try std.testing.expectEqual(fmt.DIM, hdr.dim);
-    try std.testing.expectEqual(fmt.DIM_PADDED, hdr.dim_padded);
-    try std.testing.expectEqual(@as(u32, 2), hdr.nlist);
+    try std.testing.expectEqual(nlist, hdr.nlist);
     try std.testing.expectEqual(fmt.SCALE, hdr.scale);
 
-    // Compute expected offset of the vectors block.
-    const after_header: usize = @sizeOf(fmt.Header);
-    const after_centroids: usize = after_header + 2 * @sizeOf([16]f32);
-    const after_offsets: usize = after_centroids + 3 * @sizeOf(u32);
-    const vec_off: usize = std.mem.alignForward(usize, after_offsets, fmt.VECTORS_BLOCK_ALIGN);
+    // Walk the layout to find the orig_ids block.
+    var off: usize =
+        @sizeOf(fmt.Header) +
+        nlist * @sizeOf([16]f32) +
+        (nlist + 1) * @sizeOf(u32) +
+        nlist * @sizeOf([fmt.DIM]i16) * 2;
+    const oid_off: usize = std.mem.alignForward(usize, off, fmt.BLOCK_ALIGN);
+    for (data[off..oid_off]) |b| try std.testing.expectEqual(@as(u8, 0), b);
 
-    // The padding bytes between offsets and vectors must all be zero.
-    for (data[after_offsets..vec_off]) |b| {
-        try std.testing.expectEqual(@as(u8, 0), b);
+    const oid_ptr: [*]const u32 = @ptrCast(@alignCast(data[oid_off..].ptr));
+    for (0..n_vectors) |i| try std.testing.expectEqual(@as(u32, @intCast(100 + i)), oid_ptr[i]);
+    off = oid_off + n_vectors * @sizeOf(u32);
+
+    inline for (0..fmt.DIM) |j| {
+        const dim_off: usize = std.mem.alignForward(usize, off, fmt.BLOCK_ALIGN);
+        for (data[off..dim_off]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+        const dim_ptr: [*]const i16 = @ptrCast(@alignCast(data[dim_off..].ptr));
+        for (0..n_vectors) |i| {
+            try std.testing.expectEqual(@as(i16, @intCast(j * 100 + i)), dim_ptr[i]);
+        }
+        off = dim_off + n_vectors * @sizeOf(i16);
     }
 
-    // The vectors block itself must round-trip the lane-0 sentinels.
-    const vec_ptr: [*]const i16 = @ptrCast(@alignCast(data[vec_off..].ptr));
-    for (0..8) |i| {
-        try std.testing.expectEqual(@as(i16, @intCast(i + 100)), vec_ptr[i * 16]);
-    }
-
-    // Fraud bits live immediately after the vectors block.
-    const fraud_off: usize = vec_off + 8 * @sizeOf([16]i16);
-    try std.testing.expectEqual(@as(u8, 0b00001111), data[fraud_off]);
-
-    // And the file ends right after the bitset.
-    try std.testing.expectEqual(fraud_off + 1, data.len);
+    try std.testing.expectEqual(@as(u8, 0b00001111), data[off]);
+    try std.testing.expectEqual(off + 1, data.len);
 }

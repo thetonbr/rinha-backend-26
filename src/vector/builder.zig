@@ -22,7 +22,6 @@ pub const PayloadValues = struct {
 
 pub const SCALE: i16 = 10000;
 pub const DIM: usize = 14;
-pub const DIM_PADDED: usize = 16;
 
 fn quantize(v: f32) i16 {
     // @max/@min propagate NaN, and @intFromFloat(NaN) is UB in ReleaseFast.
@@ -33,7 +32,7 @@ fn quantize(v: f32) i16 {
     return @intFromFloat(@round(clamped));
 }
 
-pub fn build(p: PayloadValues, out: *[DIM_PADDED]i16) !void {
+pub fn build(p: PayloadValues, out: *[DIM]i16) !void {
     const t = try time.parseIso8601(p.requested_at_iso);
 
     out[0] = quantize(norm.clamp01(p.amount * norm.inv_max_amount));
@@ -65,12 +64,10 @@ pub fn build(p: PayloadValues, out: *[DIM_PADDED]i16) !void {
     }
     out[12] = quantize(mcc_mod.risk(p.merch_mcc));
     out[13] = quantize(norm.clamp01(p.merch_avg_amount * norm.inv_max_merchant_avg_amount));
-    out[14] = 0;
-    out[15] = 0;
 }
 
 test "build basic payload yields expected vector" {
-    var out: [DIM_PADDED]i16 align(64) = undefined;
+    var out: [DIM]i16 = undefined;
     const known: [1][]const u8 = .{"MERC-100"};
     try build(.{
         .amount = 384.88,
@@ -92,12 +89,10 @@ test "build basic payload yields expected vector" {
     try std.testing.expectEqual(@as(i16, SCALE), out[9]);
     try std.testing.expectEqual(@as(i16, 0), out[10]);
     try std.testing.expectEqual(@as(i16, SCALE), out[11]);
-    try std.testing.expectEqual(@as(i16, 0), out[14]);
-    try std.testing.expectEqual(@as(i16, 0), out[15]);
 }
 
 test "build with null last_transaction uses sentinel" {
-    var out: [DIM_PADDED]i16 align(64) = undefined;
+    var out: [DIM]i16 = undefined;
     try build(.{
         .amount = 100.0, .installments = 1, .requested_at_iso = "2025-09-22T19:00:00Z",
         .cust_avg_amount = 100.0, .cust_tx_count_24h = 0, .cust_known_merchants = &.{},

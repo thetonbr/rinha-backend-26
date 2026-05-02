@@ -87,23 +87,17 @@ pub fn handleRead(
     }
     if (req.method == .POST and std.mem.eql(u8, req.path, "/fraud-score")) {
         const p = fraud_payload.parse(req.body, scratch) catch return responses.bad_request.bytes;
-        var qpad: [fmt.DIM_PADDED]i16 align(64) = undefined;
-        builder.build(p, &qpad) catch return responses.bad_request.bytes;
-        // Vectorized conversion: i16x16 -> i32x16 -> f32x16 -> *inv_scale.
-        // Builder zeros qpad[14..16] so qf32[14..16] end up zero, matching
-        // the centroid/vector padding contract. A single SIMD pass replaces
-        // the per-lane scalar conversion.
-        var qf32: [fmt.DIM_PADDED]f32 align(64) = undefined;
-        const Vec16i16 = @Vector(16, i16);
-        const Vec16i32 = @Vector(16, i32);
-        const Vec16f = @Vector(16, f32);
-        const qi16: Vec16i16 = qpad;
-        const qi32: Vec16i32 = qi16;
-        const qfv: Vec16f = @floatFromInt(qi32);
-        const inv_v: Vec16f = @splat(idx.inv_scale);
-        const out: Vec16f = qfv * inv_v;
-        qf32 = out;
-        const result = ivf.search(idx, &qpad, &qf32);
+        var q_int: [fmt.DIM]i16 = undefined;
+        builder.build(p, &q_int) catch return responses.bad_request.bytes;
+        // Convert i16->f32 once for the centroid stage. With DIM=14 we just
+        // unroll instead of building a wide vector — LLVM autovectorizes the
+        // 14 scalar muls into ymm ops at -O3.
+        var q_f32: [fmt.DIM]f32 = undefined;
+        const inv_scale = idx.inv_scale;
+        inline for (0..fmt.DIM) |j| {
+            q_f32[j] = @as(f32, @floatFromInt(q_int[j])) * inv_scale;
+        }
+        const result = ivf.search(idx, &q_int, &q_f32);
         return responses.fraud[result.fraud_count].bytes;
     }
     return responses.not_found.bytes;

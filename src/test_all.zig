@@ -6,11 +6,9 @@ test {
     _ = @import("json/fraud_payload.zig");
     _ = @import("http/parser.zig");
     _ = @import("http/responses.zig");
-    _ = @import("index/distance.zig");
     _ = @import("index/format.zig");
     _ = @import("index/ivf.zig");
     _ = @import("index/loader.zig");
-    _ = @import("index/topk.zig");
     _ = @import("io/uring.zig");
     _ = @import("io/conn.zig");
     _ = @import("http/server.zig");
