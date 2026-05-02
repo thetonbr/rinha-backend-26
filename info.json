@@ -1,7 +1,15 @@
 {
-    "participants": ["thetonbr"],
-    "social": ["https://github.com/thetonbr"],
-    "source-code-repo": "https://github.com/thetonbr/rinha-de-backend-2026",
-    "stack": ["zig", "io_uring", "haproxy"],
+    "participants": [
+        "thetonbr"
+    ],
+    "social": [
+        "https://github.com/thetonbr"
+    ],
+    "source-code-repo": "https://github.com/thetonbr/rinha-backend-26",
+    "stack": [
+        "zig",
+        "io_uring",
+        "haproxy"
+    ],
     "open_to_work": false
 }
