@@ -49,6 +49,14 @@ pub fn load(path: []const u8) !Index {
     );
     errdefer std.posix.munmap(raw);
 
+    // Best-effort: ask the kernel to back the mapping with 2 MB transparent
+    // hugepages and lock the pages into RAM. Both calls are advisory — they
+    // return a non-zero errno on hosts where TPH is `madvise`-only and the
+    // kernel decides not to promote, or where the container lacks IPC_LOCK.
+    // We ignore failures because the same image must run in both regimes.
+    _ = std.os.linux.madvise(@ptrCast(raw.ptr), size, std.os.linux.MADV.HUGEPAGE);
+    _ = std.os.linux.syscall2(.mlock, @intFromPtr(raw.ptr), size);
+
     if (size < @sizeOf(fmt.Header)) return error.IndexTooSmall;
     const hdr: *const fmt.Header = @ptrCast(@alignCast(raw.ptr));
     if (hdr.magic != fmt.MAGIC) return error.BadMagic;

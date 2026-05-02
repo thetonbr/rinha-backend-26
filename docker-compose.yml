@@ -9,15 +9,20 @@ services:
       - sockets:/sockets:rw
     security_opt:
       - seccomp:unconfined
+    cap_add:
+      - IPC_LOCK
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
     deploy:
       resources:
         limits:
-          cpus: "0.40"
-          memory: "150M"
+          cpus: "0.35"
+          memory: "160M"
     networks:
       - rinha-net
 
@@ -31,15 +36,20 @@ services:
       - sockets:/sockets:rw
     security_opt:
       - seccomp:unconfined
+    cap_add:
+      - IPC_LOCK
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
     deploy:
       resources:
         limits:
-          cpus: "0.40"
-          memory: "150M"
+          cpus: "0.35"
+          memory: "160M"
     networks:
       - rinha-net
 
@@ -60,8 +70,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.20"
-          memory: "50M"
+          cpus: "0.30"
+          memory: "30M"
     networks:
       - rinha-net
 
