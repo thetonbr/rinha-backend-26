@@ -28,23 +28,33 @@ pub const Conn = struct {
     keepalive: bool = true,
 };
 
+// Bitmap-backed free-slot tracker. With MAX_CONNS=256 we get exactly four
+// u64 words; finding a free slot is `@ctz(~word)` on the first non-zero word
+// (~30 cycles vs ~256-iteration linear scan in the worst case).
 pub const ConnPool = struct {
     conns: [MAX_CONNS]Conn = .{.{}} ** MAX_CONNS,
-    in_use: [MAX_CONNS]bool = .{false} ** MAX_CONNS,
+    // Bit i set means slot i is in use. Stored across 4 u64 words so each
+    // word covers 64 slots; we walk words in order (lowest first).
+    in_use_bits: [MAX_CONNS / 64]u64 = .{0} ** (MAX_CONNS / 64),
 
     pub fn alloc(self: *ConnPool) ?u32 {
-        for (&self.in_use, 0..) |*used, i| {
-            if (!used.*) {
-                used.* = true;
-                self.conns[i] = .{};
-                return @intCast(i);
-            }
+        comptime std.debug.assert(MAX_CONNS % 64 == 0);
+        for (&self.in_use_bits, 0..) |*word, w| {
+            const free_mask: u64 = ~word.*;
+            if (free_mask == 0) continue;
+            const bit: u6 = @intCast(@ctz(free_mask));
+            word.* |= (@as(u64, 1) << bit);
+            const idx: u32 = @intCast(w * 64 + @as(usize, bit));
+            self.conns[idx] = .{};
+            return idx;
         }
         return null;
     }
 
     pub fn free(self: *ConnPool, id: u32) void {
-        self.in_use[id] = false;
+        const w = id / 64;
+        const bit: u6 = @intCast(id % 64);
+        self.in_use_bits[w] &= ~(@as(u64, 1) << bit);
     }
 };
 
