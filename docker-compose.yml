@@ -1,12 +1,12 @@
 services:
   api1:
-    build:
-      context: .
-      target: api
+    image: thetonbr/rinha-zig-2026:v4
     environment:
       LISTEN_SOCKET_PATH: /sockets/api1.sock
     volumes:
       - sockets:/sockets:rw
+    security_opt:
+      - seccomp:unconfined
     deploy:
       resources:
         limits:
@@ -16,13 +16,13 @@ services:
       - rinha-net
 
   api2:
-    build:
-      context: .
-      target: api
+    image: thetonbr/rinha-zig-2026:v4
     environment:
       LISTEN_SOCKET_PATH: /sockets/api2.sock
     volumes:
       - sockets:/sockets:rw
+    security_opt:
+      - seccomp:unconfined
     deploy:
       resources:
         limits:
@@ -49,9 +49,6 @@ services:
     networks:
       - rinha-net
 
-# tmpfs-backed shared volume holding the Unix domain sockets. Bind-mounting a
-# host directory would incur an extra fs roundtrip; an internal Compose volume
-# stays in-memory and is recreated on every `up`.
 volumes:
   sockets:
 
