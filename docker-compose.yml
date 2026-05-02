@@ -3,8 +3,10 @@ services:
     build:
       context: .
       target: api
-    expose:
-      - "8080"
+    environment:
+      LISTEN_SOCKET_PATH: /sockets/api1.sock
+    volumes:
+      - sockets:/sockets:rw
     deploy:
       resources:
         limits:
@@ -17,8 +19,10 @@ services:
     build:
       context: .
       target: api
-    expose:
-      - "8080"
+    environment:
+      LISTEN_SOCKET_PATH: /sockets/api2.sock
+    volumes:
+      - sockets:/sockets:rw
     deploy:
       resources:
         limits:
@@ -31,6 +35,7 @@ services:
     image: haproxy:2.9-alpine
     volumes:
       - ./conf/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sockets:/sockets:rw
     ports:
       - "9999:9999"
     depends_on:
@@ -43,6 +48,12 @@ services:
           memory: "30M"
     networks:
       - rinha-net
+
+# tmpfs-backed shared volume holding the Unix domain sockets. Bind-mounting a
+# host directory would incur an extra fs roundtrip; an internal Compose volume
+# stays in-memory and is recreated on every `up`.
+volumes:
+  sockets:
 
 networks:
   rinha-net:
