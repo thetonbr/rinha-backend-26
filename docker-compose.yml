@@ -1,21 +1,16 @@
 services:
   api1:
-    image: thetonbr/rinha-zig-2026:v15
+    image: thetonbr/rinha-zig-2026:v16
     environment:
       LISTEN_SOCKET_PATH: /sockets/api1.sock
     volumes:
       - sockets:/sockets:rw
     security_opt:
       - seccomp:unconfined
-    cap_add:
-      - IPC_LOCK
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
-      memlock:
-        soft: -1
-        hard: -1
     deploy:
       resources:
         limits:
@@ -25,22 +20,17 @@ services:
       - rinha-net
 
   api2:
-    image: thetonbr/rinha-zig-2026:v15
+    image: thetonbr/rinha-zig-2026:v16
     environment:
       LISTEN_SOCKET_PATH: /sockets/api2.sock
     volumes:
       - sockets:/sockets:rw
     security_opt:
       - seccomp:unconfined
-    cap_add:
-      - IPC_LOCK
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
-      memlock:
-        soft: -1
-        hard: -1
     deploy:
       resources:
         limits:
