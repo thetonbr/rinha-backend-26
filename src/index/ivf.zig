@@ -108,6 +108,23 @@ inline fn bboxLowerBound(
     return s;
 }
 
+// AVX2 wide-batch lane width. With i16 inputs, diff*diff fits in i32 (2*SCALE
+// max, squared = 4e8 << 2^31), and 14 dims of squared i32 (each <= 4e8) sum
+// to <= 5.6e9 — overflows i32 but fits i64 comfortably. We accumulate per-dim
+// in i32 and widen once before adding to the i64 running sum, which keeps the
+// inner multiply in fast 8-wide ymm lanes.
+const VEC_LANES: u32 = 8;
+const Vec8i16 = @Vector(VEC_LANES, i16);
+const Vec8i32 = @Vector(VEC_LANES, i32);
+const Vec8i64 = @Vector(VEC_LANES, i64);
+
+inline fn loadDimVec(dj: []align(64) const i16, i: u32) Vec8i16 {
+    // The slice arrives 64-byte aligned and `i` is always a multiple of 8 in
+    // the wide path, so each chunk lands at a 16-byte boundary. AVX2 ymm
+    // unaligned loads on 16-byte-aligned data are zero-penalty on Zen+.
+    return dj[i..][0..VEC_LANES].*;
+}
+
 fn scanInvlist(
     idx: *const loader.Index,
     cluster_id: u32,
@@ -119,13 +136,39 @@ fn scanInvlist(
     if (end <= start) return;
 
     var i: u32 = start;
+
+    // Wide AVX2 path: 8 candidates per iteration, all 14 dims unrolled.
+    // No early-exit — trade extra work on "bad" batches for much higher SIMD
+    // utilization. SCAN_ORDER is irrelevant here (we sum every dim anyway).
+    const wide_end: u32 = start + ((end - start) / VEC_LANES) * VEC_LANES;
+    while (i < wide_end) : (i += VEC_LANES) {
+        var acc: Vec8i64 = @splat(0);
+        inline for (0..fmt.DIM) |dim_idx| {
+            const dj = idx.dims[dim_idx];
+            const raw: Vec8i16 = loadDimVec(dj, i);
+            const v32: Vec8i32 = raw; // sign-extend i16 -> i32
+            const q_splat: Vec8i32 = @splat(@as(i32, q[dim_idx]));
+            const diff = v32 - q_splat;
+            const sq = diff * diff;
+            acc += @as(Vec8i64, sq);
+        }
+        // Scatter-insert: each lane independently considers itself against
+        // the current top-5 worst. The worst tightens as we go, so we serve
+        // the lane sequence in invlist order.
+        inline for (0..VEC_LANES) |lane| {
+            const dist: u64 = @intCast(acc[lane]);
+            const idx_i: u32 = i + @as(u32, lane);
+            const oid = idx.orig_ids[idx_i];
+            if (dist < top.worst_d or (dist == top.worst_d and oid < top.worst_id)) {
+                top.tryInsert(dist, labelBit(idx.labels, idx_i), oid);
+            }
+        }
+    }
+
+    // Scalar tail with per-dim early-exit. Same loop body as before; only
+    // the bounds change (`i` already advanced by the wide block).
     while (i < end) : (i += 1) {
         var dist_acc: u64 = 0;
-        // Scalar per-dim accumulation with early-exit. We use a runtime `for`
-        // (not `inline for`) because Zig 0.13 forbids `break` inside an
-        // `inline for`, and the early-exit is the whole point. SCAN_ORDER is
-        // a comptime constant so the loop body still indexes via a known
-        // sequence — branch predictors handle the fixed-order traversal well.
         var skip = false;
         for (SCAN_ORDER) |dim_idx| {
             const qj: i32 = q[dim_idx];
