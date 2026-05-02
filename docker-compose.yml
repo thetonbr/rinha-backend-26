@@ -7,11 +7,17 @@ services:
       LISTEN_SOCKET_PATH: /sockets/api1.sock
     volumes:
       - sockets:/sockets:rw
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         limits:
-          cpus: "0.425"
-          memory: "160M"
+          cpus: "0.40"
+          memory: "150M"
     networks:
       - rinha-net
 
@@ -23,11 +29,17 @@ services:
       LISTEN_SOCKET_PATH: /sockets/api2.sock
     volumes:
       - sockets:/sockets:rw
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         limits:
-          cpus: "0.425"
-          memory: "160M"
+          cpus: "0.40"
+          memory: "150M"
     networks:
       - rinha-net
 
@@ -41,17 +53,18 @@ services:
     depends_on:
       - api1
       - api2
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         limits:
-          cpus: "0.150"
-          memory: "30M"
+          cpus: "0.20"
+          memory: "50M"
     networks:
       - rinha-net
 
-# tmpfs-backed shared volume holding the Unix domain sockets. Bind-mounting a
-# host directory would incur an extra fs roundtrip; an internal Compose volume
-# stays in-memory and is recreated on every `up`.
 volumes:
   sockets:
 
