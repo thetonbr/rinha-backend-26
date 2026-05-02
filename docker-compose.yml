@@ -1,0 +1,45 @@
+services:
+  api1:
+    image: thetonbr/rinha-zig-2026:latest
+    expose:
+      - "8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.425"
+          memory: "160M"
+    networks:
+      - rinha-net
+
+  api2:
+    image: thetonbr/rinha-zig-2026:latest
+    expose:
+      - "8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.425"
+          memory: "160M"
+    networks:
+      - rinha-net
+
+  lb:
+    image: haproxy:2.9-alpine
+    volumes:
+      - ./conf/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "9999:9999"
+    depends_on:
+      - api1
+      - api2
+    deploy:
+      resources:
+        limits:
+          cpus: "0.150"
+          memory: "30M"
+    networks:
+      - rinha-net
+
+networks:
+  rinha-net:
+    driver: bridge
