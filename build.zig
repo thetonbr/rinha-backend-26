@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
             .cpu_arch = .x86_64,
             .os_tag = .linux,
             .abi = .musl,
-            .cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 },
+            .cpu_model = .{ .explicit = &std.Target.x86.cpu.haswell },
         },
     });
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });

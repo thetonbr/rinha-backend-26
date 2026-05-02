@@ -57,15 +57,16 @@ pub fn handleRead(
         const p = fraud_payload.parse(req.body, scratch) catch return responses.bad_request.bytes;
         var q_int: [fmt.DIM]i16 = undefined;
         builder.build(p, &q_int) catch return responses.bad_request.bytes;
-        // Convert i16->f32 once for the centroid stage. With DIM=14 we just
-        // unroll instead of building a wide vector — LLVM autovectorizes the
-        // 14 scalar muls into ymm ops at -O3.
-        var q_f32: [fmt.DIM]f32 = undefined;
+        // Convert i16->f32 once for the centroid stage and pad to 16 lanes so
+        // the centroid distance kernel can do a single Vec16f32 subtract +
+        // square-and-reduce. Lanes 14-15 are zero in both query and centroid
+        // (the index layout pads centroids to 16) so they cancel in the diff.
+        var q_f32_padded: [16]f32 = .{0.0} ** 16;
         const inv_scale = idx.inv_scale;
         inline for (0..fmt.DIM) |j| {
-            q_f32[j] = @as(f32, @floatFromInt(q_int[j])) * inv_scale;
+            q_f32_padded[j] = @as(f32, @floatFromInt(q_int[j])) * inv_scale;
         }
-        const result = ivf.search(idx, &q_int, &q_f32);
+        const result = ivf.search(idx, &q_int, &q_f32_padded);
         return responses.fraud[result.fraud_count].bytes;
     }
     return responses.not_found.bytes;

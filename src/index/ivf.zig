@@ -78,13 +78,17 @@ inline fn labelBit(labels: []const u8, idx: u32) u8 {
     return @intCast((labels[idx >> 3] >> @intCast(idx & 7)) & 1);
 }
 
-inline fn centroidSqDistF32(q: *const [fmt.DIM]f32, cent: *const [16]f32) f32 {
-    var s: f32 = 0;
-    inline for (0..fmt.DIM) |j| {
-        const d = q[j] - cent[j];
-        s += d * d;
-    }
-    return s;
+// Centroids ship as 16-lane padded f32 (lanes 14-15 are zero in the index
+// layout). Loading both operands as a 16-wide vector lets one ymm pair (vsubps
+// + vmulps + vaddps) cover the whole distance, vs the 14-iteration unrolled
+// scalar form. The query is padded to [16]f32 by the caller (lanes 14-15 = 0)
+// so the extra lanes contribute zero to the squared distance.
+const Vf16 = @Vector(16, f32);
+inline fn centroidSqDistF32(q_padded: *const [16]f32, cent: *const [16]f32) f32 {
+    const qv: Vf16 = q_padded.*;
+    const cv: Vf16 = cent.*;
+    const d = qv - cv;
+    return @reduce(.Add, d * d);
 }
 
 // Squared lower-bound of the cluster's axis-aligned bounding box from `q_int`.
@@ -189,7 +193,7 @@ fn scanInvlist(
 pub fn search(
     idx: *const loader.Index,
     q_int: *const [fmt.DIM]i16,
-    q_f32: *const [fmt.DIM]f32,
+    q_f32_padded: *const [16]f32,
 ) SearchResult {
     const nlist: u32 = idx.header.nlist;
     std.debug.assert(nlist <= MAX_NLIST);
@@ -204,7 +208,7 @@ pub fn search(
     while (c < nlist) : (c += 1) {
         const cent_off: usize = @as(usize, c) * 16;
         const cent_full: *const [16]f32 = idx.centroids[cent_off..][0..16];
-        const d = centroidSqDistF32(q_f32, cent_full);
+        const d = centroidSqDistF32(q_f32_padded, cent_full);
         if (d < probe_dist[NPROBE - 1]) {
             var pos: usize = NPROBE - 1;
             while (pos > 0 and d < probe_dist[pos - 1]) : (pos -= 1) {
@@ -327,7 +331,7 @@ test "search on synthetic V2 index returns valid fraud_count" {
     // top-5 is full of zero-distance hits, so cluster 1 is pruned). Top-5
     // therefore contains all 4 fraud vectors plus one slot still at sentinel.
     const q_int: [fmt.DIM]i16 = .{0} ** fmt.DIM;
-    const q_f32: [fmt.DIM]f32 = .{0.0} ** fmt.DIM;
-    const result = search(&idx, &q_int, &q_f32);
+    const q_f32_padded: [16]f32 = .{0.0} ** 16;
+    const result = search(&idx, &q_int, &q_f32_padded);
     try std.testing.expectEqual(@as(u8, 4), result.fraud_count);
 }

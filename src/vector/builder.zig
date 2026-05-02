@@ -10,7 +10,12 @@ pub const PayloadValues = struct {
     cust_avg_amount: f32,
     cust_tx_count_24h: u32,
     cust_known_merchants: []const []const u8,
+    // FNV-1a u64 of each entry in `cust_known_merchants`, computed once at
+    // parse time. Lets the membership test in build() short-circuit on a
+    // single u64 compare before falling back to std.mem.eql for collisions.
+    cust_known_hashes: []const u64,
     merch_id: []const u8,
+    merch_id_hash: u64,
     merch_mcc: u32,
     merch_avg_amount: f32,
     term_is_online: bool,
@@ -56,8 +61,10 @@ pub fn build(p: PayloadValues, out: *[DIM]i16) !void {
     out[9] = if (p.term_is_online) SCALE else 0;
     out[10] = if (p.term_card_present) SCALE else 0;
     out[11] = SCALE;
-    for (p.cust_known_merchants) |m| {
-        if (std.mem.eql(u8, m, p.merch_id)) {
+    // Hash compare first (8-byte word equality, branch-light), fall back to
+    // full string compare only on collision to preserve correctness.
+    for (p.cust_known_hashes, p.cust_known_merchants) |h, m| {
+        if (h == p.merch_id_hash and std.mem.eql(u8, m, p.merch_id)) {
             out[11] = 0;
             break;
         }
@@ -69,6 +76,7 @@ pub fn build(p: PayloadValues, out: *[DIM]i16) !void {
 test "build basic payload yields expected vector" {
     var out: [DIM]i16 = undefined;
     const known: [1][]const u8 = .{"MERC-100"};
+    const known_h: [1]u64 = .{fnv1aU64Test("MERC-100")};
     try build(.{
         .amount = 384.88,
         .installments = 3,
@@ -76,7 +84,9 @@ test "build basic payload yields expected vector" {
         .cust_avg_amount = 230.50,
         .cust_tx_count_24h = 3,
         .cust_known_merchants = known[0..],
+        .cust_known_hashes = known_h[0..],
         .merch_id = "MERC-001",
+        .merch_id_hash = fnv1aU64Test("MERC-001"),
         .merch_mcc = 5912,
         .merch_avg_amount = 312.0,
         .term_is_online = true,
@@ -96,10 +106,23 @@ test "build with null last_transaction uses sentinel" {
     try build(.{
         .amount = 100.0, .installments = 1, .requested_at_iso = "2025-09-22T19:00:00Z",
         .cust_avg_amount = 100.0, .cust_tx_count_24h = 0, .cust_known_merchants = &.{},
-        .merch_id = "X", .merch_mcc = 5411, .merch_avg_amount = 100.0,
+        .cust_known_hashes = &.{},
+        .merch_id = "X", .merch_id_hash = fnv1aU64Test("X"),
+        .merch_mcc = 5411, .merch_avg_amount = 100.0,
         .term_is_online = false, .term_card_present = true, .term_km_from_home = 0.0,
         .last_tx_minutes = null, .last_tx_km = null,
     }, &out);
     try std.testing.expectEqual(@as(i16, -10000), out[5]);
     try std.testing.expectEqual(@as(i16, -10000), out[6]);
+}
+
+// Test-only mirror of fraud_payload.fnv1aU64; kept private to avoid pulling
+// the parser into the builder's compile graph for production.
+fn fnv1aU64Test(s: []const u8) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (s) |c| {
+        h ^= c;
+        h = h *% 0x100000001b3;
+    }
+    return h;
 }
