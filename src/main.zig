@@ -83,6 +83,11 @@ fn openUnixListener(path: []const u8) !i32 {
     // we use the strict form for portability with strace/tools.
     const addrlen: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1);
     try std.posix.bind(fd, @ptrCast(&addr), addrlen);
+    // The default mode of bind() inherits umask, leaving the socket as 0755.
+    // HAProxy in a sibling container connects with a different effective uid,
+    // so without the world-write bit it gets EACCES on connect(). 0666 keeps
+    // every user on the shared volume able to talk to the API.
+    try std.posix.fchmodat(linux.AT.FDCWD, path, 0o666, 0);
     try std.posix.listen(fd, LISTEN_BACKLOG);
     return fd;
 }
