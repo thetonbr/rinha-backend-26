@@ -160,9 +160,23 @@ pub fn main() !void {
         .fraud_bits = bits,
     });
 
-    // Placeholder recall validation; replaced in a follow-up task.
-    const r = try recall_mod.validateExactVsApprox(allocator, vectors, labels, 1000);
-    std.debug.print("Recall@5: {d:.4}, Decision flip rate: {d:.4}\n", .{ r.recall_at_5, r.decision_flip_rate });
+    // Recall validation: stage-1 argmin + stage-2 invlist scan + stage-3 bbox
+    // repair in pure f32 vs exhaustive top-5. 2k queries gives a tight enough
+    // confidence interval (±~1.5%) without padding container build by minutes.
+    const r = try recall_mod.validateExactVsApprox(
+        allocator,
+        vectors,
+        labels,
+        km.centroids,
+        km.assignments,
+        nlist,
+        2000,
+        0xdeadbeef,
+    );
+    std.debug.print(
+        "Recall@5: {d:.4} | fraud_count match: {d:.4} | approval flip: {d:.4} | avg clusters/query: {d:.2}\n",
+        .{ r.recall_at_5, r.fraud_count_match_rate, r.approval_flip_rate, r.avg_clusters_visited },
+    );
 
     std.debug.print("Done.\n", .{});
 }
