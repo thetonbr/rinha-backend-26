@@ -1,6 +1,6 @@
 services:
   api1:
-    image: thetonbr/rinha-zig-2026:v16
+    image: thetonbr/rinha-zig-2026:v17
     environment:
       LISTEN_SOCKET_PATH: /sockets/api1.sock
     volumes:
@@ -20,7 +20,7 @@ services:
       - rinha-net
 
   api2:
-    image: thetonbr/rinha-zig-2026:v16
+    image: thetonbr/rinha-zig-2026:v17
     environment:
       LISTEN_SOCKET_PATH: /sockets/api2.sock
     volumes:
