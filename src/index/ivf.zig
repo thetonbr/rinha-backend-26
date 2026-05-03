@@ -239,25 +239,58 @@ pub fn search(
     const nlist: u32 = idx.header.nlist;
     std.debug.assert(nlist <= MAX_NLIST);
 
-    // Stage 1: select NPROBE closest centroids in f32. NPROBE=1 in production,
-    // so this is just an argmin; we keep the small insertion-sort for clarity
-    // and to make NPROBE configurable.
+    // Stage 1: select NPROBE closest centroids in f32. NPROBE=1 in production
+    // so we specialise on argmin and let four 16-lane f32 distances run in
+    // parallel — the LLVM scheduler will fuse them onto independent ymm
+    // dependency chains, hiding the @reduce(.Add, d*d) cross-lane reduction
+    // latency. Falls back to a serial insertion-sort for NPROBE > 1 so we
+    // keep the code path flexible when re-evaluating recall.
     var probe_id: [NPROBE]i32 = .{-1} ** NPROBE;
     var probe_dist: [NPROBE]f32 = .{std.math.inf(f32)} ** NPROBE;
 
-    var c: u32 = 0;
-    while (c < nlist) : (c += 1) {
-        const cent_off: usize = @as(usize, c) * 16;
-        const cent_full: *const [16]f32 = idx.centroids[cent_off..][0..16];
-        const d = centroidSqDistF32(q_f32_padded, cent_full);
-        if (d < probe_dist[NPROBE - 1]) {
-            var pos: usize = NPROBE - 1;
-            while (pos > 0 and d < probe_dist[pos - 1]) : (pos -= 1) {
-                probe_dist[pos] = probe_dist[pos - 1];
-                probe_id[pos] = probe_id[pos - 1];
+    if (comptime NPROBE == 1) {
+        var best_id: u32 = 0;
+        var best_d: f32 = std.math.inf(f32);
+        var c: u32 = 0;
+        const wide_end: u32 = nlist & ~@as(u32, 3);
+        while (c < wide_end) : (c += 4) {
+            const base: usize = @as(usize, c) * 16;
+            const c0: *const [16]f32 = idx.centroids[base..][0..16];
+            const c1: *const [16]f32 = idx.centroids[base + 16 ..][0..16];
+            const c2: *const [16]f32 = idx.centroids[base + 32 ..][0..16];
+            const c3: *const [16]f32 = idx.centroids[base + 48 ..][0..16];
+            const d0 = centroidSqDistF32(q_f32_padded, c0);
+            const d1 = centroidSqDistF32(q_f32_padded, c1);
+            const d2 = centroidSqDistF32(q_f32_padded, c2);
+            const d3 = centroidSqDistF32(q_f32_padded, c3);
+            if (d0 < best_d) { best_d = d0; best_id = c; }
+            if (d1 < best_d) { best_d = d1; best_id = c + 1; }
+            if (d2 < best_d) { best_d = d2; best_id = c + 2; }
+            if (d3 < best_d) { best_d = d3; best_id = c + 3; }
+        }
+        while (c < nlist) : (c += 1) {
+            const cent_off: usize = @as(usize, c) * 16;
+            const cent_full: *const [16]f32 = idx.centroids[cent_off..][0..16];
+            const d = centroidSqDistF32(q_f32_padded, cent_full);
+            if (d < best_d) { best_d = d; best_id = c; }
+        }
+        probe_id[0] = @intCast(best_id);
+        probe_dist[0] = best_d;
+    } else {
+        var c: u32 = 0;
+        while (c < nlist) : (c += 1) {
+            const cent_off: usize = @as(usize, c) * 16;
+            const cent_full: *const [16]f32 = idx.centroids[cent_off..][0..16];
+            const d = centroidSqDistF32(q_f32_padded, cent_full);
+            if (d < probe_dist[NPROBE - 1]) {
+                var pos: usize = NPROBE - 1;
+                while (pos > 0 and d < probe_dist[pos - 1]) : (pos -= 1) {
+                    probe_dist[pos] = probe_dist[pos - 1];
+                    probe_id[pos] = probe_id[pos - 1];
+                }
+                probe_dist[pos] = d;
+                probe_id[pos] = @intCast(c);
             }
-            probe_dist[pos] = d;
-            probe_id[pos] = @intCast(c);
         }
     }
 
@@ -316,6 +349,95 @@ test "Top5 rejects worse than worst" {
     inline for (0..K) |i| t.tryInsert(@as(u64, i + 1), 0, @as(u32, @intCast(i)));
     t.tryInsert(99, 1, 999);
     try std.testing.expectEqual(@as(u8, 0), t.fraudCount());
+}
+
+test "stage-1 batched argmin agrees with serial argmin across 10 centroids" {
+    // Build a 10-cluster index where centroids differ on a single dim each, so
+    // a query aimed near centroid k must pick that cluster at Stage 1. Verifies
+    // the 4-wide centroid batch + scalar-tail finds the same minimum index as
+    // a serial scan would, including positions inside the tail (8, 9).
+    const path = "/tmp/rinha_test_ivf_stage1_batch.bin";
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const nlist: u32 = 10;
+    // 8 vectors per cluster: enough to fill top-5 from a single cluster so
+    // worst_d settles at 0 and the bbox-repair stage can soundly prune the
+    // other 9 clusters in the test. Anything <5 leaves worst_d at sentinel
+    // and bbox repair would visit every cluster regardless of Stage 1 pick.
+    const per_cluster: u32 = 8;
+    const n: u32 = nlist * per_cluster;
+
+    // Centroids: c[k][0] = (k+1) * 1000.0, all other lanes 0. Query at
+    // (k+1) * 1000.0 lands on centroid k uniquely.
+    var centroids: [nlist][16]f32 = .{.{0.0} ** 16} ** nlist;
+    inline for (0..nlist) |k| centroids[k][0] = @as(f32, @floatFromInt(k + 1)) * 0.1; // f32 unit space
+
+    var offsets: [nlist + 1]u32 = undefined;
+    inline for (0..nlist + 1) |k| offsets[k] = @intCast(k * per_cluster);
+
+    // bbox per cluster: tight box around centroid coordinate.
+    var bbox_min: [nlist][fmt.DIM]i16 = undefined;
+    var bbox_max: [nlist][fmt.DIM]i16 = undefined;
+    inline for (0..nlist) |k| {
+        const v: i16 = @intCast((@as(i32, k) + 1) * 1000); // dim0 only
+        bbox_min[k] = .{0} ** fmt.DIM;
+        bbox_max[k] = .{0} ** fmt.DIM;
+        bbox_min[k][0] = v;
+        bbox_max[k][0] = v;
+    }
+
+    var orig_ids: [n]u32 = undefined;
+    inline for (0..n) |i| orig_ids[i] = i;
+
+    // Each cluster's `per_cluster` vectors share dim0 = (k+1)*1000, others 0.
+    var dim_storage: [fmt.DIM][n]i16 = undefined;
+    inline for (0..fmt.DIM) |j| {
+        var k: u32 = 0;
+        while (k < nlist) : (k += 1) {
+            const v: i16 = if (j == 0) @intCast((@as(i32, @intCast(k)) + 1) * 1000) else 0;
+            var slot: u32 = 0;
+            while (slot < per_cluster) : (slot += 1) {
+                dim_storage[j][k * per_cluster + slot] = v;
+            }
+        }
+    }
+    var dim_init: [fmt.DIM][]const i16 = undefined;
+    inline for (0..fmt.DIM) |j| dim_init[j] = dim_storage[j][0..];
+
+    // Cluster 0: all 8 fraud (top-5 fully fraud → fraud_count=5 if Stage 1
+    // hits cluster 0). Other clusters: all legit (fraud_count=0). A wrong
+    // Stage 1 pick or a missed prune would surface as a non-{0,5} count.
+    var labels_buf: [(n + 7) / 8]u8 = .{0} ** ((n + 7) / 8);
+    inline for (0..per_cluster) |slot| {
+        labels_buf[slot >> 3] |= @as(u8, 1) << @intCast(slot & 7);
+    }
+
+    try loader.writeSyntheticV2(
+        path,
+        n,
+        nlist,
+        centroids[0..],
+        offsets[0..],
+        bbox_min[0..],
+        bbox_max[0..],
+        orig_ids[0..],
+        dim_init[0..],
+        labels_buf[0..],
+    );
+    var idx = try loader.load(path);
+    defer loader.unload(&idx);
+
+    // Aim at the tail (cluster 8 and 9) so the scalar-tail of the batched
+    // argmin is exercised, not just the wide path.
+    inline for ([_]u32{ 0, 1, 4, 7, 8, 9 }) |target| {
+        var q_int: [fmt.DIM]i16 = .{0} ** fmt.DIM;
+        q_int[0] = @intCast((target + 1) * 1000);
+        var q_padded: [16]f32 = .{0.0} ** 16;
+        inline for (0..fmt.DIM) |j| q_padded[j] = @as(f32, @floatFromInt(q_int[j])) * idx.inv_scale;
+        const result = search(&idx, &q_int, &q_padded);
+        const expected: u8 = if (target == 0) 5 else 0;
+        try std.testing.expectEqual(expected, result.fraud_count);
+    }
 }
 
 test "wide-path early-exit matches exhaustive top-5 on dense cluster" {
