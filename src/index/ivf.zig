@@ -34,26 +34,20 @@ pub const MAX_NLIST: usize = 256;
 // The trick: even when the recall@5 set drifts (a different vector enters
 // top-5), it carries the same fraud/legit label as the one it displaced, so
 // the aggregated fraud_count is preserved bit-for-bit. fraud_count_match and
-// approval_flip stay at 100% / 0% all the way down to cap=4 in the local
-// 2 k sample.
+// approval_flip stay at 100% / 0% all the way down to cap=4 *in the local
+// 2 k sample*. That sample turned out to be too small to characterise the
+// production tail.
 //
-// v19 used cap=8 and shipped p99 = 2.23 ms (final 5651.92, +208 over v18 at
-// cap=∞). v20 tightens to cap=4 to claw back the remaining ~1.2 ms gap to
-// the p99 ceiling. Trade-offs vs cap=8:
+//   v19 cap=8: judge p99 = 2.23 ms, FP=0 FN=0, score_det = 3000, final = 5652.
+//   v20 cap=4: judge p99 = 2.06 ms, FP=11 FN=11, E=44, absolute_penalty
+//              -495.96, score_det = 2504, final = 5191.  Net: -461.
 //
-//                cap=8    cap=4
-//   recall@5    99.11 %  97.76 %
-//   apv_flip    0.0000   0.0000   (offline 2 k queries)
-//   avg scans   2.87     2.16
-//   p99 scans   8        4
-//
-// The 1.35 pp drop in recall is invisible to score_det as long as the
-// missing vectors keep agreeing on label — which held across every cap from
-// 4 to 24 in the offline sweep. The risk lives in the ~52 k judge queries
-// the validator did not see; if any of those need >4 bbox-repair scans to
-// keep the right answer we will see FP/FN > 0 in the next bench and back
-// off to cap=6 or cap=8.
-pub const MAX_CLUSTERS_VISITED: u32 = 4;
+// score_det's penalty term is `-300 · log10(1 + E)`, so even a single label
+// flip surfacing in the judge run wipes ~90 pts and any cap below 8 has
+// proven worse on net. cap=8 is the floor of the safe family until we
+// switch to a different lever (AVX-512 wide scan, NPROBE > 1 with bbox
+// repair preserved, Stage-2 SIMD pipeline tightening, etc.).
+pub const MAX_CLUSTERS_VISITED: u32 = 8;
 
 pub const SearchResult = struct {
     fraud_count: u8,
