@@ -169,7 +169,7 @@ pub fn main() !void {
     // Recall validation. Cap matches the runtime (src/index/ivf.zig
     // MAX_CLUSTERS_VISITED) so the offline metrics reflect what the API
     // actually computes per request. 2k queries gives ±~1.5 % CI.
-    const RUNTIME_CAP: u32 = 8;
+    const RUNTIME_CAP: u32 = 4;
     const r = try recall_mod.validateExactVsApprox(
         allocator,
         vectors,

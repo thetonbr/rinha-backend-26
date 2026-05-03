@@ -34,16 +34,26 @@ pub const MAX_NLIST: usize = 256;
 // The trick: even when the recall@5 set drifts (a different vector enters
 // top-5), it carries the same fraud/legit label as the one it displaced, so
 // the aggregated fraud_count is preserved bit-for-bit. fraud_count_match and
-// approval_flip stay at 100% / 0% all the way down to cap=4. We pick 8 to
-// keep recall@5 at 99.11 % (a margin against the long tail not represented
-// in the 2k sample) while halving the worst-case stage-3 cost vs cap=16.
+// approval_flip stay at 100% / 0% all the way down to cap=4 in the local
+// 2 k sample.
 //
-// Net effect at runtime: average CPU per query falls ~18 % (avg 3.50 → 2.87
-// scans), and the p99-scans tail collapses 21 → 8. With 0.35 CPU per
-// container the freed CPU budget reduces cgroup CFS throttle pressure
-// during burst — that throttle is the suspected dominant component of the
-// production p99 latency we measured at 3.45-3.60 ms with no cap.
-pub const MAX_CLUSTERS_VISITED: u32 = 8;
+// v19 used cap=8 and shipped p99 = 2.23 ms (final 5651.92, +208 over v18 at
+// cap=∞). v20 tightens to cap=4 to claw back the remaining ~1.2 ms gap to
+// the p99 ceiling. Trade-offs vs cap=8:
+//
+//                cap=8    cap=4
+//   recall@5    99.11 %  97.76 %
+//   apv_flip    0.0000   0.0000   (offline 2 k queries)
+//   avg scans   2.87     2.16
+//   p99 scans   8        4
+//
+// The 1.35 pp drop in recall is invisible to score_det as long as the
+// missing vectors keep agreeing on label — which held across every cap from
+// 4 to 24 in the offline sweep. The risk lives in the ~52 k judge queries
+// the validator did not see; if any of those need >4 bbox-repair scans to
+// keep the right answer we will see FP/FN > 0 in the next bench and back
+// off to cap=6 or cap=8.
+pub const MAX_CLUSTERS_VISITED: u32 = 4;
 
 pub const SearchResult = struct {
     fraud_count: u8,
