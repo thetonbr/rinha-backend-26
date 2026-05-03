@@ -28,7 +28,12 @@ pub const SearchResult = struct {
 // signal (recency / distance from last transaction). dim2 (amount-vs-avg
 // ratio) and dim0 (raw amount) follow, then card-present / online flags, and
 // finally the low-variance dims (day_of_week, MCC risk).
+//
+// The first 8 entries are deliberately also the 8 most discriminative dims;
+// the wide AVX2 scan computes them first and uses the running minimum across
+// the 8-vector batch as a lower bound to prune the remaining 6 dims.
 const SCAN_ORDER = [_]u8{ 5, 6, 2, 0, 7, 8, 11, 12, 9, 10, 1, 13, 3, 4 };
+const SCAN_PREFIX: usize = 8;
 
 const Top5 = struct {
     dist: [K]u64 = .{std.math.maxInt(u64)} ** K,
@@ -141,16 +146,39 @@ fn scanInvlist(
 
     var i: u32 = start;
 
-    // Wide AVX2 path: 8 candidates per iteration, all 14 dims unrolled.
-    // No early-exit — trade extra work on "bad" batches for much higher SIMD
-    // utilization. SCAN_ORDER is irrelevant here (we sum every dim anyway).
+    // Wide AVX2 path: 8 candidates per iteration, two-phase early-exit.
+    //
+    // Phase 1: process the 8 most-discriminative dims (SCAN_ORDER prefix). The
+    // partial squared distance after these 8 is a *lower bound* on the final
+    // 14-dim distance, since each of the remaining 6 dims contributes a non-
+    // negative squared delta. If the minimum across the 8-lane batch is already
+    // >= worst_d, no member of this batch can enter the top-5 and we skip the
+    // remaining 6 dims entirely.
+    //
+    // Phase 2: only when the lower bound clears, finish the remaining 6 dims
+    // and run the per-lane scatter-insert against top.
     const wide_end: u32 = start + ((end - start) / VEC_LANES) * VEC_LANES;
     while (i < wide_end) : (i += VEC_LANES) {
         var acc: Vec8i64 = @splat(0);
-        inline for (0..fmt.DIM) |dim_idx| {
+        inline for (0..SCAN_PREFIX) |k| {
+            const dim_idx = comptime SCAN_ORDER[k];
             const dj = idx.dims[dim_idx];
             const raw: Vec8i16 = loadDimVec(dj, i);
             const v32: Vec8i32 = raw; // sign-extend i16 -> i32
+            const q_splat: Vec8i32 = @splat(@as(i32, q[dim_idx]));
+            const diff = v32 - q_splat;
+            const sq = diff * diff;
+            acc += @as(Vec8i64, sq);
+        }
+        // acc[lane] >= 0 since each contribution is a square; cast is safe.
+        const min_partial: u64 = @intCast(@reduce(.Min, acc));
+        if (min_partial >= top.worst_d) continue;
+
+        inline for (SCAN_PREFIX..fmt.DIM) |k| {
+            const dim_idx = comptime SCAN_ORDER[k];
+            const dj = idx.dims[dim_idx];
+            const raw: Vec8i16 = loadDimVec(dj, i);
+            const v32: Vec8i32 = raw;
             const q_splat: Vec8i32 = @splat(@as(i32, q[dim_idx]));
             const diff = v32 - q_splat;
             const sq = diff * diff;
@@ -275,6 +303,95 @@ test "Top5 rejects worse than worst" {
     inline for (0..K) |i| t.tryInsert(@as(u64, i + 1), 0, @as(u32, @intCast(i)));
     t.tryInsert(99, 1, 999);
     try std.testing.expectEqual(@as(u8, 0), t.fraudCount());
+}
+
+test "wide-path early-exit matches exhaustive top-5 on dense cluster" {
+    // Build a synthetic index with 16 vectors (two wide-path batches) all in
+    // a single cluster, then verify search() returns the exact same fraud_count
+    // as a brute-force top-5 over the same 16 vectors. Exercises the new
+    // SCAN_PREFIX lower-bound prune across multiple batches with varied data.
+    const path = "/tmp/rinha_test_ivf_early_exit.bin";
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const n: u32 = 16;
+    const nlist: u32 = 1;
+    const centroids: [1][16]f32 = .{.{0.0} ** 16};
+    const offsets: [2]u32 = .{ 0, n };
+    const bbox_min: [1][fmt.DIM]i16 = .{.{std.math.minInt(i16)} ** fmt.DIM};
+    const bbox_max: [1][fmt.DIM]i16 = .{.{std.math.maxInt(i16)} ** fmt.DIM};
+    var orig_ids: [n]u32 = undefined;
+    inline for (0..n) |i| orig_ids[i] = i;
+
+    // Each vector picks its 14 i16 values from a pseudo-random walk of the
+    // index modulo the SCALE range, half marked fraud. Resulting top-5 is
+    // non-trivial (not all at the origin) so the early-exit branch must be
+    // taken some times and skipped others.
+    var dim_storage: [fmt.DIM][n]i16 = undefined;
+    inline for (0..fmt.DIM) |j| {
+        inline for (0..n) |i| {
+            const v: i32 = @intCast(((i + 1) * (j + 1) * 137) % 4000);
+            dim_storage[j][i] = @intCast(v);
+        }
+    }
+    var dim_init: [fmt.DIM][]const i16 = undefined;
+    inline for (0..fmt.DIM) |j| dim_init[j] = dim_storage[j][0..];
+
+    // labels: alternating fraud/legit gives 8 fraud, 8 legit
+    const labels: [2]u8 = .{ 0b10101010, 0b10101010 };
+
+    try loader.writeSyntheticV2(
+        path,
+        n,
+        nlist,
+        centroids[0..],
+        offsets[0..],
+        bbox_min[0..],
+        bbox_max[0..],
+        orig_ids[0..],
+        dim_init[0..],
+        labels[0..],
+    );
+    var idx = try loader.load(path);
+    defer loader.unload(&idx);
+
+    // Sweep multiple queries; for each, brute-force the top-5 (smallest
+    // squared L2 distance, tie-break by orig_id) and compare fraud_count.
+    const queries = [_][fmt.DIM]i16{
+        .{0} ** fmt.DIM,
+        .{500} ** fmt.DIM,
+        .{ 100, -200, 300, -400, 500, -600, 700, -800, 100, 200, 300, 400, 500, 600 },
+        .{ 3000, 2500, 2000, 1500, 1000, 500, 0, -500, -1000, -1500, -2000, -2500, -3000, 0 },
+    };
+
+    for (queries) |q| {
+        var brute_dist: [n]u64 = undefined;
+        for (0..n) |i| {
+            var s: u64 = 0;
+            inline for (0..fmt.DIM) |j| {
+                const d: i64 = @as(i64, q[j]) - @as(i64, dim_storage[j][i]);
+                s += @as(u64, @intCast(d * d));
+            }
+            brute_dist[i] = s;
+        }
+        // Top-5 by (dist, orig_id) lex order on this 16-element set.
+        var ranks: [n]u32 = undefined;
+        for (0..n) |i| ranks[i] = @intCast(i);
+        std.mem.sort(u32, &ranks, &brute_dist, struct {
+            fn lt(ctx: *const [n]u64, a: u32, b: u32) bool {
+                const da = ctx[a];
+                const db = ctx[b];
+                return da < db or (da == db and a < b);
+            }
+        }.lt);
+        var expected: u8 = 0;
+        for (ranks[0..5]) |r| expected += labelBit(idx.labels, r);
+
+        var q_padded: [16]f32 = .{0.0} ** 16;
+        inline for (0..fmt.DIM) |j| q_padded[j] = @as(f32, @floatFromInt(q[j])) * idx.inv_scale;
+
+        const result = search(&idx, &q, &q_padded);
+        try std.testing.expectEqual(expected, result.fraud_count);
+    }
 }
 
 test "search on synthetic V2 index returns valid fraud_count" {
