@@ -28,6 +28,10 @@ pub const Result = struct {
     fraud_count_match_rate: f32,
     approval_flip_rate: f32,
     avg_clusters_visited: f32,
+    p50_clusters_visited: u32,
+    p99_clusters_visited: u32,
+    p999_clusters_visited: u32,
+    max_clusters_visited: u32,
 };
 
 inline fn distSq(a: [DIM]f32, b: [DIM]f32) f32 {
@@ -137,6 +141,7 @@ fn approxTopK(
     bbox_lo: []const [DIM]f32,
     bbox_hi: []const [DIM]f32,
     nlist: u32,
+    max_clusters: u32, // 0 = unlimited; otherwise hard cap on total clusters scanned
 ) ApproxOut {
     // Stage 1: argmin centroid.
     var best_id: u32 = 0;
@@ -162,9 +167,14 @@ fn approxTopK(
         }
     }
 
-    // Stage 3: bbox repair on the remaining nlist - 1 clusters.
+    // Stage 3: bbox repair on the remaining nlist - 1 clusters. The repair
+    // is mathematically exact when max_clusters=0 — every cluster whose bbox
+    // lower bound clears worst_d must be scanned to preserve top-K. When a
+    // cap is in effect, repairs above the cap are silently dropped, which
+    // can flip a top-K member if the cap is too tight.
     var ci: u32 = 0;
     while (ci < nlist) : (ci += 1) {
+        if (max_clusters != 0 and visited >= max_clusters) break;
         if (ci == best_id) continue;
         const start = invlist_offsets[ci];
         const end = invlist_offsets[ci + 1];
@@ -188,6 +198,7 @@ pub fn validateExactVsApprox(
     nlist: u32,
     n_queries: usize,
     seed: u64,
+    max_clusters: u32, // 0 = unlimited; cap on bbox-repair pass
 ) !Result {
     std.debug.assert(vectors.len == is_fraud.len);
     std.debug.assert(vectors.len == assignments.len);
@@ -248,6 +259,12 @@ pub fn validateExactVsApprox(
     var approval_flip: u32 = 0;
     var clusters_visited_sum: u64 = 0;
 
+    // Per-query sample of clusters_visited. We need this to compute the
+    // distribution (p50/p99/p999/max) — averages mask the long tail that
+    // drives the production p99 latency.
+    const cv_samples = try allocator.alloc(u32, n_queries);
+    defer allocator.free(cv_samples);
+
     var qi: usize = 0;
     while (qi < n_queries) : (qi += 1) {
         const q_idx = r.uintLessThan(usize, vectors.len);
@@ -263,6 +280,7 @@ pub fn validateExactVsApprox(
             bbox_lo,
             bbox_hi,
             nlist,
+            max_clusters,
         );
 
         // Top-5 overlap (orig_id sets).
@@ -283,7 +301,16 @@ pub fn validateExactVsApprox(
         if (exact_fc == approx_fc) fraud_match += 1;
         if ((exact_fc < 3) != (approx_fc < 3)) approval_flip += 1;
         clusters_visited_sum += approx.clusters_visited;
+        cv_samples[qi] = approx.clusters_visited;
     }
+
+    // Sort the samples in place to extract percentiles. n_queries is small
+    // (~2k) so sort time is irrelevant compared to the brute-force scan
+    // already paid above.
+    std.mem.sort(u32, cv_samples, {}, std.sort.asc(u32));
+    const p50_idx: usize = n_queries / 2;
+    const p99_idx: usize = (n_queries * 99) / 100;
+    const p999_idx: usize = (n_queries * 999) / 1000;
 
     const n_f: f32 = @floatFromInt(n_queries);
     return .{
@@ -292,6 +319,10 @@ pub fn validateExactVsApprox(
         .fraud_count_match_rate = @as(f32, @floatFromInt(fraud_match)) / n_f,
         .approval_flip_rate = @as(f32, @floatFromInt(approval_flip)) / n_f,
         .avg_clusters_visited = @as(f32, @floatFromInt(clusters_visited_sum)) / n_f,
+        .p50_clusters_visited = cv_samples[p50_idx],
+        .p99_clusters_visited = cv_samples[p99_idx],
+        .p999_clusters_visited = cv_samples[p999_idx],
+        .max_clusters_visited = cv_samples[n_queries - 1],
     };
 }
 
@@ -356,6 +387,7 @@ test "validateExactVsApprox identifies a perfectly clusterable dataset" {
         nlist,
         100,
         12345,
+        0, // no cap
     );
 
     // With perfect cluster separation, the approx pick must agree with brute
@@ -364,4 +396,8 @@ test "validateExactVsApprox identifies a perfectly clusterable dataset" {
     try std.testing.expect(res.fraud_count_match_rate >= 0.99);
     try std.testing.expectEqual(@as(f32, 0.0), res.approval_flip_rate);
     try std.testing.expect(res.avg_clusters_visited <= 1.5);
+    // Max cluster scans must also stay tight on disjoint boxes — if any
+    // single query visits more than 2 clusters, the lower-bound prune is
+    // letting noise through.
+    try std.testing.expect(res.max_clusters_visited <= 2);
 }

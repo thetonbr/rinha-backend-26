@@ -166,9 +166,10 @@ pub fn main() !void {
         .fraud_bits = bits,
     });
 
-    // Recall validation: stage-1 argmin + stage-2 invlist scan + stage-3 bbox
-    // repair in pure f32 vs exhaustive top-5. 2k queries gives a tight enough
-    // confidence interval (±~1.5%) without padding container build by minutes.
+    // Recall validation. Cap matches the runtime (src/index/ivf.zig
+    // MAX_CLUSTERS_VISITED) so the offline metrics reflect what the API
+    // actually computes per request. 2k queries gives ±~1.5 % CI.
+    const RUNTIME_CAP: u32 = 8;
     const r = try recall_mod.validateExactVsApprox(
         allocator,
         vectors,
@@ -178,10 +179,16 @@ pub fn main() !void {
         nlist,
         2000,
         0xdeadbeef,
+        RUNTIME_CAP,
     );
     std.debug.print(
-        "Recall@5: {d:.4} | fraud_count match: {d:.4} | approval flip: {d:.4} | avg clusters/query: {d:.2}\n",
-        .{ r.recall_at_5, r.fraud_count_match_rate, r.approval_flip_rate, r.avg_clusters_visited },
+        "[cap={d}] Recall@5: {d:.4} | fraud match: {d:.4} | approval flip: {d:.4}\n" ++
+            "         clusters/query: avg={d:.2} p50={d} p99={d} p999={d} max={d}\n",
+        .{
+            RUNTIME_CAP,             r.recall_at_5,         r.fraud_count_match_rate,
+            r.approval_flip_rate,    r.avg_clusters_visited, r.p50_clusters_visited,
+            r.p99_clusters_visited,  r.p999_clusters_visited, r.max_clusters_visited,
+        },
     );
 
     std.debug.print("Done.\n", .{});

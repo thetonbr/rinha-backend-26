@@ -19,6 +19,32 @@ pub const K: usize = 5;
 // runtime if a smaller nlist is loaded.
 pub const MAX_NLIST: usize = 256;
 
+// Hard ceiling on the number of clusters scanned per query, including the
+// stage-2 probed cluster (NPROBE) and every stage-3 bbox-repair scan. The
+// offline recall validator (build_index/recall.zig, sweep over caps 0/24/16/
+// 12/8/4) showed that on 2k random samples from the 3M-vector reference set:
+//
+//                cap=0   cap=24  cap=16  cap=12  cap=8   cap=4
+//   recall@5    1.0000  0.9995  0.9977  0.9961  0.9911  0.9776
+//   fc_match    1.0000  1.0000  1.0000  1.0000  1.0000  1.0000
+//   apv_flip    0.0000  0.0000  0.0000  0.0000  0.0000  0.0000
+//   avg scans   3.50    3.48    3.37    3.21    2.87    2.16
+//   p99 scans   21      21      16      12      8       4
+//
+// The trick: even when the recall@5 set drifts (a different vector enters
+// top-5), it carries the same fraud/legit label as the one it displaced, so
+// the aggregated fraud_count is preserved bit-for-bit. fraud_count_match and
+// approval_flip stay at 100% / 0% all the way down to cap=4. We pick 8 to
+// keep recall@5 at 99.11 % (a margin against the long tail not represented
+// in the 2k sample) while halving the worst-case stage-3 cost vs cap=16.
+//
+// Net effect at runtime: average CPU per query falls ~18 % (avg 3.50 → 2.87
+// scans), and the p99-scans tail collapses 21 → 8. With 0.35 CPU per
+// container the freed CPU budget reduces cgroup CFS throttle pressure
+// during burst — that throttle is the suspected dominant component of the
+// production p99 latency we measured at 3.45-3.60 ms with no cap.
+pub const MAX_CLUSTERS_VISITED: u32 = 8;
+
 pub const SearchResult = struct {
     fraud_count: u8,
 };
@@ -300,22 +326,30 @@ pub fn search(
     }
 
     // Stage 2: scan probed clusters with per-dim early-exit feeding Top5.
+    // We track the running count of fully-scanned clusters so stage 3 can
+    // honour MAX_CLUSTERS_VISITED.
     var top: Top5 = .{};
     var scanned: [MAX_NLIST]bool = .{false} ** MAX_NLIST;
+    var visited: u32 = 0;
     inline for (0..NPROBE) |k| {
         const cid_signed = probe_id[k];
         if (cid_signed >= 0) {
             const cid: u32 = @intCast(cid_signed);
             scanned[cid] = true;
             scanInvlist(idx, cid, q_int, &top);
+            visited += 1;
         }
     }
 
     // Stage 3: bounding-box repair. For each non-probed cluster, compute the
     // squared lower-bound of its bbox vs the query in i16. If lb > worst_d we
     // can prove no member of that cluster can enter the top-5 and skip it.
+    // Once `visited` reaches MAX_CLUSTERS_VISITED we stop scanning even if
+    // some bbox would still pass — the offline validator showed the dropped
+    // candidates do not change fraud_count or approval, only top-5 identity.
     var ci: u32 = 0;
     while (ci < nlist) : (ci += 1) {
+        if (visited >= MAX_CLUSTERS_VISITED) break;
         if (scanned[ci]) continue;
         const start = idx.invlist_offsets[ci];
         const end = idx.invlist_offsets[ci + 1];
@@ -326,6 +360,7 @@ pub fn search(
         const lb = bboxLowerBound(q_int, bmin, bmax);
         if (lb <= top.worst_d) {
             scanInvlist(idx, ci, q_int, &top);
+            visited += 1;
         }
     }
 
