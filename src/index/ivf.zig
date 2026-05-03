@@ -127,6 +127,15 @@ const Vec8i16 = @Vector(VEC_LANES, i16);
 const Vec8i32 = @Vector(VEC_LANES, i32);
 const Vec8i64 = @Vector(VEC_LANES, i64);
 
+// Lookahead distance in vectors for the per-dim @prefetch hint inside the wide
+// scan. 64 vectors = 128 bytes per dim ≈ 2 cache lines, ≈ 8 wide-batches ahead.
+// Sized empirically to cover ~500-700ns of memory latency: enough to mask DRAM
+// fetch when an invlist exceeds L2, small enough not to evict the live working
+// set. Too large evicts the in-flight cache lines; too small leaves the load
+// stalled. The HW prefetcher tracks ~16 sequential streams; with 14 dims plus
+// orig_ids/labels we are at the edge, so explicit hints close the gap.
+const PREFETCH_AHEAD: u32 = 64;
+
 inline fn loadDimVec(dj: []align(64) const i16, i: u32) Vec8i16 {
     // The slice arrives 64-byte aligned and `i` is always a multiple of 8 in
     // the wide path, so each chunk lands at a 16-byte boundary. AVX2 ymm
@@ -163,6 +172,10 @@ fn scanInvlist(
         inline for (0..SCAN_PREFIX) |k| {
             const dim_idx = comptime SCAN_ORDER[k];
             const dj = idx.dims[dim_idx];
+            // Hint the line for this dim 64 vectors ahead. Pointer arithmetic
+            // bypasses bounds check; @prefetch on an invalid mapping is a no-op
+            // on x86 (it cannot fault), so reading past `end` is harmless.
+            @prefetch(dj.ptr + i + PREFETCH_AHEAD, .{ .rw = .read, .locality = 1, .cache = .data });
             const raw: Vec8i16 = loadDimVec(dj, i);
             const v32: Vec8i32 = raw; // sign-extend i16 -> i32
             const q_splat: Vec8i32 = @splat(@as(i32, q[dim_idx]));
