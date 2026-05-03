@@ -54,8 +54,14 @@ pub fn main() !void {
         l.* = r.is_fraud;
     }
 
+    // 25 Lloyd iterations: 10 was leaving ~2% of vectors still flipping
+    // clusters at exit, which inflates the runtime stage-3 bbox-repair cost
+    // because looser centroids produce wider boxes that fail to prune. 25
+    // hits the convergence criterion (<0.1% changes) on the real 3M dataset
+    // and adds roughly 60-90 s to the offline image build — paid once, never
+    // at request time.
     std.debug.print("Training k-means k={d}...\n", .{nlist});
-    var km = try kmeans.train(allocator, vectors, nlist, 10, 42);
+    var km = try kmeans.train(allocator, vectors, nlist, 25, 42);
     defer km.deinit();
 
     // Pad centroids from 14 → 16 f32 lanes so they can be loaded with a wide
