@@ -1,7 +1,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const loader = @import("index/loader.zig");
-const epoll = @import("io/epoll.zig");
+const server = @import("http/server.zig");
 const fmt = @import("index/format.zig");
 
 const DEFAULT_INDEX_PATH = "/index/index.bin";
@@ -27,7 +27,7 @@ pub fn main() !void {
     const fd = if (sock_path_opt) |p| try openUnixListener(p) else try openTcpListener();
     defer std.posix.close(fd);
 
-    try epoll.run(fd, &idx);
+    try server.run(fd, &idx);
 }
 
 fn openTcpListener() !i32 {
