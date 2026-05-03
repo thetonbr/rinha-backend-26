@@ -190,6 +190,11 @@ fn scanInvlist(
         inline for (SCAN_PREFIX..fmt.DIM) |k| {
             const dim_idx = comptime SCAN_ORDER[k];
             const dj = idx.dims[dim_idx];
+            // Phase 2 reaches dims SCAN_ORDER[8..14] only after the early-exit
+            // misses, which means worst_d is loose and we will likely process
+            // the next batch as well. Prefetch ahead so the cold dims do not
+            // stall when phase 1 promotes them to the hot path next round.
+            @prefetch(dj.ptr + i + PREFETCH_AHEAD, .{ .rw = .read, .locality = 1, .cache = .data });
             const raw: Vec8i16 = loadDimVec(dj, i);
             const v32: Vec8i32 = raw;
             const q_splat: Vec8i32 = @splat(@as(i32, q[dim_idx]));
