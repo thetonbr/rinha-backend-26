@@ -8,10 +8,19 @@ const loader = @import("loader.zig");
 //   Stage 2 — Scan probed invlists with per-dimension early-exit (most
 //             candidates are discarded after 2-3 dims when worst_d is tight).
 //   Stage 3 — Bounding-box repair: visit any non-probed cluster whose bbox
-//             lower bound is <= worst_d. Preserves recall at NPROBE=1.
+//             lower bound is <= worst_d, capped by MAX_CLUSTERS_VISITED.
 //
 // Top-5 is materialized inline with deterministic tie-break by orig_id.
-pub const NPROBE: usize = 1;
+//
+// NPROBE=2 vs NPROBE=1: stage 2 scans the 2 closest centroids instead of 1.
+// The extra scan costs ~50 µs in the average case, but it lets worst_d
+// settle around the true 2nd-cluster minimum *before* stage 3 starts. Stage
+// 3 then prunes more aggressively because the bbox lower-bound has a
+// tighter target to clear, and the cap=8 budget is used on fewer scans
+// rather than burnt repairing what stage 2 should already cover. Expected
+// effect on the production p99: tighter tail (worst case = 8 scans still,
+// but reached less often).
+pub const NPROBE: usize = 2;
 pub const K: usize = 5;
 
 // Used to cap stage 3's "already scanned" bitmap. 256 matches DEFAULT_NLIST
