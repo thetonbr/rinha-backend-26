@@ -167,7 +167,7 @@ pub fn main() !void {
     });
 
     // Single-cap mirror of runtime (src/index/ivf.zig MAX_CLUSTERS_VISITED).
-    const RUNTIME_CAP: u32 = 12;
+    const RUNTIME_CAP: u32 = 16;
     const r = try recall_mod.validateExactVsApprox(
         allocator, vectors, labels, km.centroids, km.assignments,
         nlist, 2000, 0xdeadbeef, RUNTIME_CAP,
