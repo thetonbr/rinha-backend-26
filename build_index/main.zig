@@ -167,27 +167,20 @@ pub fn main() !void {
     });
 
     // Recall validation. Cap matches the runtime (src/index/ivf.zig
-    // MAX_CLUSTERS_VISITED) so the offline metrics reflect what the API
-    // actually computes per request. 2k queries gives ±~1.5 % CI.
-    const RUNTIME_CAP: u32 = 8;
+    // MAX_CLUSTERS_VISITED) so the metrics reflect what the API computes.
+    const RUNTIME_CAP: u32 = 12;
     const r = try recall_mod.validateExactVsApprox(
-        allocator,
-        vectors,
-        labels,
-        km.centroids,
-        km.assignments,
-        nlist,
-        2000,
-        0xdeadbeef,
-        RUNTIME_CAP,
+        allocator, vectors, labels, km.centroids, km.assignments,
+        nlist, 2000, 0xdeadbeef, RUNTIME_CAP,
     );
     std.debug.print(
-        "[cap={d}] Recall@5: {d:.4} | fraud match: {d:.4} | approval flip: {d:.4}\n" ++
-            "         clusters/query: avg={d:.2} p50={d} p99={d} p999={d} max={d}\n",
+        "[nlist={d} cap={d}] Recall@5: {d:.4} | fraud match: {d:.4} | approval flip: {d:.4}\n" ++
+            "                  clusters/query: avg={d:.2} p50={d} p99={d} p999={d} max={d}\n",
         .{
-            RUNTIME_CAP,             r.recall_at_5,         r.fraud_count_match_rate,
-            r.approval_flip_rate,    r.avg_clusters_visited, r.p50_clusters_visited,
-            r.p99_clusters_visited,  r.p999_clusters_visited, r.max_clusters_visited,
+            nlist,                   RUNTIME_CAP,           r.recall_at_5,
+            r.fraud_count_match_rate, r.approval_flip_rate, r.avg_clusters_visited,
+            r.p50_clusters_visited,  r.p99_clusters_visited, r.p999_clusters_visited,
+            r.max_clusters_visited,
         },
     );
 

@@ -22,10 +22,12 @@ const loader = @import("loader.zig");
 pub const NPROBE: usize = 1;
 pub const K: usize = 5;
 
-// Used to cap stage 3's "already scanned" bitmap. 256 matches DEFAULT_NLIST
-// and is the only configuration we ship; ivf.search asserts on overflow at
-// runtime if a smaller nlist is loaded.
-pub const MAX_NLIST: usize = 256;
+// Used to cap stage 3's "already scanned" bitmap. ivf.search asserts on
+// overflow if a smaller nlist is loaded. We ship nlist=512 (Dockerfile
+// ARG NLIST=512) so each invlist holds ~5800 vectors instead of ~12k —
+// each scanInvlist call halves in cost, and Stage 3 with cap=8 covers the
+// same fraction of the dataset for less CPU.
+pub const MAX_NLIST: usize = 512;
 
 // Hard ceiling on the number of clusters scanned per query, including the
 // stage-2 probed cluster (NPROBE) and every stage-3 bbox-repair scan. The
@@ -39,23 +41,29 @@ pub const MAX_NLIST: usize = 256;
 //   avg scans   3.50    3.48    3.37    3.21    2.87    2.16
 //   p99 scans   21      21      16      12      8       4
 //
-// The trick: even when the recall@5 set drifts (a different vector enters
-// top-5), it carries the same fraud/legit label as the one it displaced, so
-// the aggregated fraud_count is preserved bit-for-bit. fraud_count_match and
-// approval_flip stay at 100% / 0% all the way down to cap=4 *in the local
-// 2 k sample*. That sample turned out to be too small to characterise the
-// production tail.
+//   v19 nlist=256 cap=8: judge p99 = 2.23 ms, FP=0 FN=0, det = 3000, final = 5652.
+//   v20 nlist=256 cap=4: judge p99 = 2.06 ms, FP=11 FN=11, E=44, det = 2504,
+//                        final = 5191 (absolute_penalty -496 wiped the gain).
 //
-//   v19 cap=8: judge p99 = 2.23 ms, FP=0 FN=0, score_det = 3000, final = 5652.
-//   v20 cap=4: judge p99 = 2.06 ms, FP=11 FN=11, E=44, absolute_penalty
-//              -495.96, score_det = 2504, final = 5191.  Net: -461.
+// v23 switches the index to nlist=512 so each cluster holds ~6k vectors
+// instead of ~12k. A single scanInvlist call now costs ~80 µs (down from
+// ~160 µs), but the average query needs to scan more clusters because the
+// bbox of each smaller cluster covers less volume. The cap sweep at nlist
+// =512 (build_index/recall.zig over caps 0/24/16/12/8 on 2 k queries):
 //
-// score_det's penalty term is `-300 · log10(1 + E)`, so even a single label
-// flip surfacing in the judge run wipes ~90 pts and any cap below 8 has
-// proven worse on net. cap=8 is the floor of the safe family until we
-// switch to a different lever (AVX-512 wide scan, NPROBE > 1 with bbox
-// repair preserved, Stage-2 SIMD pipeline tightening, etc.).
-pub const MAX_CLUSTERS_VISITED: u32 = 8;
+//                cap=0   cap=24  cap=16  cap=12  cap=8
+//   recall@5    1.0000  0.9979  0.9935  0.9890  0.9785
+//   apv_flip    0.0000  0.0000  0.0000  0.0000  0.0005
+//   avg scans   4.89    4.70    4.35    3.97    3.35
+//   p99 scans   31      24      16      12      8
+//
+// cap=8 surfaces an approval flip in the 2 k sample (judge would extrapolate
+// to ~13-15 errors and lose ~270 pts to absolute_penalty). cap=12 is the
+// tightest cap with apv_flip=0 and recall margin (1.1 %) similar to v19's
+// nlist=256/cap=8 (0.9 %), which scored 0 production errors. Net cost in
+// CPU: avg 4.97 × 80 µs = 318 µs (vs 459 µs at v19), worst case 960 µs (vs
+// 1.28 ms). Lower CPU should reduce cgroup throttle pressure → tighter p99.
+pub const MAX_CLUSTERS_VISITED: u32 = 12;
 
 pub const SearchResult = struct {
     fraud_count: u8,
