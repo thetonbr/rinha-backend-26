@@ -12,15 +12,14 @@ const loader = @import("loader.zig");
 //
 // Top-5 is materialized inline with deterministic tie-break by orig_id.
 //
-// NPROBE=2 vs NPROBE=1: stage 2 scans the 2 closest centroids instead of 1.
-// The extra scan costs ~50 µs in the average case, but it lets worst_d
-// settle around the true 2nd-cluster minimum *before* stage 3 starts. Stage
-// 3 then prunes more aggressively because the bbox lower-bound has a
-// tighter target to clear, and the cap=8 budget is used on fewer scans
-// rather than burnt repairing what stage 2 should already cover. Expected
-// effect on the production p99: tighter tail (worst case = 8 scans still,
-// but reached less often).
-pub const NPROBE: usize = 2;
+// NPROBE=2 was tested on the judge in v21 (issue #929) and produced no
+// measurable change in p99 vs NPROBE=1 (2.24ms vs 2.23ms — within noise).
+// The hypothesis that scanning a second cluster would tighten worst_d
+// enough to make stage 3 prune more aggressively did not survive: the
+// top-5 is dominated by the closest cluster, the second cluster rarely
+// contributes any winners. Reverting to NPROBE=1 keeps the stage-1
+// batched-argmin specialization on the hot path.
+pub const NPROBE: usize = 1;
 pub const K: usize = 5;
 
 // Used to cap stage 3's "already scanned" bitmap. 256 matches DEFAULT_NLIST

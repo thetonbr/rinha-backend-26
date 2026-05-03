@@ -6,11 +6,17 @@ const loader = @import("../index/loader.zig");
 const fraud_payload = @import("../json/fraud_payload.zig");
 
 // Multishot accept (kernel >= 5.19) keeps the same SQE armed across all
-// incoming connections, saving one prep_accept per accept. The Rinha judge
-// runs Ubuntu 24.04 (kernel 6.x) so this is the default. Set to false to
-// force single-shot accept with manual re-arm — useful on older kernels
-// (e.g. WSL2 5.15) where multishot silently never fires.
-pub const USE_MULTISHOT_ACCEPT: bool = true;
+// incoming connections, saving one prep_accept per accept. We saw the
+// multishot variant interact badly with HAProxy mode http + http-reuse
+// always under WSL2 5.15 smoke (the first probe never returned a CQE,
+// HAProxy timed out the layer-7 health check at 1 s and the backend was
+// marked DOWN before any request arrived). Single-shot reposted accept is
+// the same shape the API used in v17/epoll-era and works reliably.
+//
+// In mode http + http-reuse, HAProxy holds the same backend Unix socket
+// across many client requests, so accept rate is low and the per-accept
+// re-arm cost (~50 ns of one extra prep_accept) is negligible.
+pub const USE_MULTISHOT_ACCEPT: bool = false;
 
 // Backing storage for the accept SQE address fields. Kernel writes here on
 // every accepted connection (multishot mode); single-shot also reuses these.
