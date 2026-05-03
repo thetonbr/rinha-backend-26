@@ -23,11 +23,10 @@ pub const NPROBE: usize = 1;
 pub const K: usize = 5;
 
 // Used to cap stage 3's "already scanned" bitmap. ivf.search asserts on
-// overflow if a smaller nlist is loaded. We ship nlist=512 (Dockerfile
-// ARG NLIST=512) so each invlist holds ~5800 vectors instead of ~12k —
-// each scanInvlist call halves in cost, and Stage 3 with cap=8 covers the
-// same fraction of the dataset for less CPU.
-pub const MAX_NLIST: usize = 512;
+// overflow if a smaller nlist is loaded. v24 ships nlist=1024 (Dockerfile
+// ARG NLIST=1024) so each invlist holds ~3k vectors and each scanInvlist
+// call costs ~28 µs (down from ~55 µs at nlist=512, ~110 µs at nlist=256).
+pub const MAX_NLIST: usize = 1024;
 
 // Hard ceiling on the number of clusters scanned per query, including the
 // stage-2 probed cluster (NPROBE) and every stage-3 bbox-repair scan. The
@@ -57,12 +56,24 @@ pub const MAX_NLIST: usize = 512;
 //   avg scans   4.89    4.70    4.35    3.97    3.35
 //   p99 scans   31      24      16      12      8
 //
-// cap=8 surfaces an approval flip in the 2 k sample (judge would extrapolate
-// to ~13-15 errors and lose ~270 pts to absolute_penalty). cap=12 is the
-// tightest cap with apv_flip=0 and recall margin (1.1 %) similar to v19's
-// nlist=256/cap=8 (0.9 %), which scored 0 production errors. Net cost in
-// CPU: avg 4.97 × 80 µs = 318 µs (vs 459 µs at v19), worst case 960 µs (vs
-// 1.28 ms). Lower CPU should reduce cgroup throttle pressure → tighter p99.
+// v23 (nlist=512, cap=12) shipped p99=1.90 ms / final=5721.82 on the judge,
+// +69.90 over v19. v24 doubles nlist again to 1024 (~3k vectors per cluster).
+// Cap sweep at nlist=1024 (build_index/recall.zig, 2 k queries):
+//
+//                cap=0   cap=32  cap=24  cap=20  cap=16  cap=12  cap=8
+//   recall@5    1.0000  0.9994  0.9975  0.9960  0.9921  0.9851  0.9746
+//   apv_flip    0.0000  0.0000  0.0000  0.0000  0.0000  0.0000  0.0000
+//   avg scans   5.52    5.47    5.36    5.23    4.99    4.57    3.90
+//   p99 scans   30      30      24      20      16      12      8
+//
+// At nlist=1024 every cap from 32 down to 8 holds apv_flip=0 in the 2 k
+// sample. cap=8 with margin 2.54 % is the most aggressive; v20's prod blow-
+// up at cap=4 / margin 2.24 % shows that wide margins extrapolate badly.
+// We pick cap=12 (margin 1.49 %, similar to v23's 1.10 % which produced 0
+// production errors). Per-cluster scan ~28 µs at this size, so:
+//   v19 (nlist=256, cap=8):  avg 459 µs, worst 1.28 ms
+//   v23 (nlist=512, cap=12): avg 318 µs, worst 960 µs
+//   v24 (nlist=1024, cap=12): avg 128 µs, worst 336 µs
 pub const MAX_CLUSTERS_VISITED: u32 = 12;
 
 pub const SearchResult = struct {

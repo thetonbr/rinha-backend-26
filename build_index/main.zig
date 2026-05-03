@@ -166,8 +166,7 @@ pub fn main() !void {
         .fraud_bits = bits,
     });
 
-    // Recall validation. Cap matches the runtime (src/index/ivf.zig
-    // MAX_CLUSTERS_VISITED) so the metrics reflect what the API computes.
+    // Single-cap mirror of runtime (src/index/ivf.zig MAX_CLUSTERS_VISITED).
     const RUNTIME_CAP: u32 = 12;
     const r = try recall_mod.validateExactVsApprox(
         allocator, vectors, labels, km.centroids, km.assignments,
@@ -175,7 +174,7 @@ pub fn main() !void {
     );
     std.debug.print(
         "[nlist={d} cap={d}] Recall@5: {d:.4} | fraud match: {d:.4} | approval flip: {d:.4}\n" ++
-            "                  clusters/query: avg={d:.2} p50={d} p99={d} p999={d} max={d}\n",
+            "                   clusters/query: avg={d:.2} p50={d} p99={d} p999={d} max={d}\n",
         .{
             nlist,                   RUNTIME_CAP,           r.recall_at_5,
             r.fraud_count_match_rate, r.approval_flip_rate, r.avg_clusters_visited,

@@ -6,7 +6,7 @@ pub const MAGIC: u32 = 0x4148_4E52;
 // designed for per-dim early-exit scan with NPROBE=1 + bbox repair.
 pub const VERSION: u32 = 2;
 pub const DIM: u32 = 14;
-pub const DEFAULT_NLIST: u32 = 512;
+pub const DEFAULT_NLIST: u32 = 1024;
 pub const SCALE: u32 = 10000;
 
 // Each per-dim block (and the orig_ids block) starts on a 64-byte boundary so
