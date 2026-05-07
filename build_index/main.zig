@@ -166,20 +166,56 @@ pub fn main() !void {
         .fraud_bits = bits,
     });
 
-    // Single-cap mirror of runtime (src/index/ivf.zig MAX_CLUSTERS_VISITED).
-    const RUNTIME_CAP: u32 = 12;
-    const r = try recall_mod.validateExactVsApprox(
+    // Mirror runtime adaptive caps (src/index/ivf.zig FAST_CLUSTERS,
+    // FULL_CLUSTERS). We also report the fixed-cap baseline at FAST_CLUSTERS
+    // for comparison: the gap between adaptive and FAST shows how much recall
+    // the escalation buys, and the gap between adaptive and FULL shows the
+    // ceiling of the escalation.
+    const FAST_CLUSTERS: u32 = 8;
+    const FULL_CLUSTERS: u32 = 24;
+
+    const fast_only = try recall_mod.validateExactVsApprox(
         allocator, vectors, labels, km.centroids, km.assignments,
-        nlist, 2000, 0xdeadbeef, RUNTIME_CAP,
+        nlist, 2000, 0xdeadbeef, FAST_CLUSTERS, 0,
     );
     std.debug.print(
-        "[nlist={d} cap={d}] Recall@5: {d:.4} | fraud match: {d:.4} | approval flip: {d:.4}\n" ++
-            "                   clusters/query: avg={d:.2} p50={d} p99={d} p999={d} max={d}\n",
+        "[nlist={d} fast={d} only ] recall@5: {d:.4} | fc_match: {d:.4} | apv_flip: {d:.4}\n" ++
+            "                          clusters/query: avg={d:.2} p50={d} p99={d} p999={d} max={d}\n",
         .{
-            nlist,                   RUNTIME_CAP,           r.recall_at_5,
-            r.fraud_count_match_rate, r.approval_flip_rate, r.avg_clusters_visited,
-            r.p50_clusters_visited,  r.p99_clusters_visited, r.p999_clusters_visited,
-            r.max_clusters_visited,
+            nlist,                          FAST_CLUSTERS,                  fast_only.recall_at_5,
+            fast_only.fraud_count_match_rate, fast_only.approval_flip_rate, fast_only.avg_clusters_visited,
+            fast_only.p50_clusters_visited,  fast_only.p99_clusters_visited, fast_only.p999_clusters_visited,
+            fast_only.max_clusters_visited,
+        },
+    );
+
+    const adaptive = try recall_mod.validateExactVsApprox(
+        allocator, vectors, labels, km.centroids, km.assignments,
+        nlist, 2000, 0xdeadbeef, FAST_CLUSTERS, FULL_CLUSTERS,
+    );
+    std.debug.print(
+        "[nlist={d} fast={d}/full={d}] recall@5: {d:.4} | fc_match: {d:.4} | apv_flip: {d:.4}\n" ++
+            "                          clusters/query: avg={d:.2} p50={d} p99={d} p999={d} max={d}\n",
+        .{
+            nlist,                          FAST_CLUSTERS,                  FULL_CLUSTERS,
+            adaptive.recall_at_5,           adaptive.fraud_count_match_rate, adaptive.approval_flip_rate,
+            adaptive.avg_clusters_visited,  adaptive.p50_clusters_visited,  adaptive.p99_clusters_visited,
+            adaptive.p999_clusters_visited, adaptive.max_clusters_visited,
+        },
+    );
+
+    const full_only = try recall_mod.validateExactVsApprox(
+        allocator, vectors, labels, km.centroids, km.assignments,
+        nlist, 2000, 0xdeadbeef, FULL_CLUSTERS, 0,
+    );
+    std.debug.print(
+        "[nlist={d} full={d} only ] recall@5: {d:.4} | fc_match: {d:.4} | apv_flip: {d:.4}\n" ++
+            "                          clusters/query: avg={d:.2} p50={d} p99={d} p999={d} max={d}\n",
+        .{
+            nlist,                          FULL_CLUSTERS,                  full_only.recall_at_5,
+            full_only.fraud_count_match_rate, full_only.approval_flip_rate, full_only.avg_clusters_visited,
+            full_only.p50_clusters_visited,  full_only.p99_clusters_visited, full_only.p999_clusters_visited,
+            full_only.max_clusters_visited,
         },
     );
 

@@ -140,8 +140,10 @@ fn approxTopK(
     inv_to_orig: []const u32,
     bbox_lo: []const [DIM]f32,
     bbox_hi: []const [DIM]f32,
+    is_fraud: []const bool,
     nlist: u32,
-    max_clusters: u32, // 0 = unlimited; otherwise hard cap on total clusters scanned
+    fast_clusters: u32, // 0 = unlimited fast pass
+    full_clusters: u32, // 0 = no escalation; otherwise upper bound when adaptive triggers
 ) ApproxOut {
     // Stage 1: argmin centroid.
     var best_id: u32 = 0;
@@ -167,14 +169,12 @@ fn approxTopK(
         }
     }
 
-    // Stage 3: bbox repair on the remaining nlist - 1 clusters. The repair
-    // is mathematically exact when max_clusters=0 — every cluster whose bbox
-    // lower bound clears worst_d must be scanned to preserve top-K. When a
-    // cap is in effect, repairs above the cap are silently dropped, which
-    // can flip a top-K member if the cap is too tight.
+    // Stage 3a (fast): bbox repair until visited >= fast_clusters. The repair
+    // is mathematically exact when fast_clusters=0 — every cluster whose bbox
+    // lower bound clears worst_d must be scanned to preserve top-K.
     var ci: u32 = 0;
     while (ci < nlist) : (ci += 1) {
-        if (max_clusters != 0 and visited >= max_clusters) break;
+        if (fast_clusters != 0 and visited >= fast_clusters) break;
         if (ci == best_id) continue;
         const start = invlist_offsets[ci];
         const end = invlist_offsets[ci + 1];
@@ -183,6 +183,28 @@ fn approxTopK(
         if (lb <= top.worstDist()) {
             scanInvlist(q, vectors, inv_to_orig, start, end, &top);
             visited += 1;
+        }
+    }
+
+    // Stage 3b (adaptive escalation): if full_clusters > fast_clusters and the
+    // fast count lands on the approval boundary (∈ {2, 3}), keep scanning until
+    // visited reaches full_clusters. Mirrors the runtime adaptive-nprobe path
+    // in src/index/ivf.zig so offline metrics reflect production behaviour.
+    if (full_clusters > fast_clusters) {
+        const fast_fc = top.fraudCount(is_fraud);
+        if (fast_fc == 2 or fast_fc == 3) {
+            while (ci < nlist) : (ci += 1) {
+                if (visited >= full_clusters) break;
+                if (ci == best_id) continue;
+                const start = invlist_offsets[ci];
+                const end = invlist_offsets[ci + 1];
+                if (end <= start) continue;
+                const lb = bboxLowerBound(q, bbox_lo[ci], bbox_hi[ci]);
+                if (lb <= top.worstDist()) {
+                    scanInvlist(q, vectors, inv_to_orig, start, end, &top);
+                    visited += 1;
+                }
+            }
         }
     }
 
@@ -198,7 +220,8 @@ pub fn validateExactVsApprox(
     nlist: u32,
     n_queries: usize,
     seed: u64,
-    max_clusters: u32, // 0 = unlimited; cap on bbox-repair pass
+    fast_clusters: u32, // 0 = unlimited fast pass (no escalation needed)
+    full_clusters: u32, // 0 = no escalation; > fast_clusters enables adaptive
 ) !Result {
     std.debug.assert(vectors.len == is_fraud.len);
     std.debug.assert(vectors.len == assignments.len);
@@ -279,8 +302,10 @@ pub fn validateExactVsApprox(
             inv_to_orig,
             bbox_lo,
             bbox_hi,
+            is_fraud,
             nlist,
-            max_clusters,
+            fast_clusters,
+            full_clusters,
         );
 
         // Top-5 overlap (orig_id sets).
@@ -387,7 +412,8 @@ test "validateExactVsApprox identifies a perfectly clusterable dataset" {
         nlist,
         100,
         12345,
-        0, // no cap
+        0, // unlimited fast pass
+        0, // no escalation
     );
 
     // With perfect cluster separation, the approx pick must agree with brute

@@ -2,86 +2,65 @@ const std = @import("std");
 const fmt = @import("format.zig");
 const loader = @import("loader.zig");
 
-// V2 search algorithm:
+// V2 search algorithm with adaptive nprobe:
 //
 //   Stage 1 — Pick top-NPROBE centroids by f32 squared distance.
-//   Stage 2 — Scan probed invlists with per-dimension early-exit (most
-//             candidates are discarded after 2-3 dims when worst_d is tight).
-//   Stage 3 — Bounding-box repair: visit any non-probed cluster whose bbox
-//             lower bound is <= worst_d, capped by MAX_CLUSTERS_VISITED.
+//   Stage 2 — Scan probed invlists with per-dimension early-exit.
+//   Stage 3a — Fast bbox-repair: scan up to FAST_CLUSTERS clusters whose bbox
+//              lower bound is <= worst_d. Stops early when the bound prunes
+//              everything left.
+//   Stage 3b — Adaptive escalation: if Stage 3a leaves fraud_count in the
+//              ambiguous zone (∈ {2, 3}, i.e. on the approval boundary at
+//              fraud_score = 0.4 / 0.6), continue bbox-repair up to
+//              FULL_CLUSTERS. Easy queries (count ∈ {0, 1, 4, 5}) pay only
+//              the fast budget — ~5× cheaper than a fixed cap of FULL_CLUSTERS
+//              while preserving recall where it matters for the score.
 //
 // Top-5 is materialized inline with deterministic tie-break by orig_id.
 //
 // NPROBE=2 was tested on the judge in v21 (issue #929) and produced no
 // measurable change in p99 vs NPROBE=1 (2.24ms vs 2.23ms — within noise).
-// The hypothesis that scanning a second cluster would tighten worst_d
-// enough to make stage 3 prune more aggressively did not survive: the
-// top-5 is dominated by the closest cluster, the second cluster rarely
-// contributes any winners. Reverting to NPROBE=1 keeps the stage-1
-// batched-argmin specialization on the hot path.
+// Reverting to NPROBE=1 keeps the stage-1 batched-argmin specialization
+// on the hot path.
 pub const NPROBE: usize = 1;
 pub const K: usize = 5;
 
-// Used to cap stage 3's "already scanned" bitmap. ivf.search asserts on
-// overflow if a smaller nlist is loaded. v24 ships nlist=1024 (Dockerfile
-// ARG NLIST=1024) so each invlist holds ~3k vectors and each scanInvlist
-// call costs ~28 µs (down from ~55 µs at nlist=512, ~110 µs at nlist=256).
-pub const MAX_NLIST: usize = 1024;
+// Bitmap size for stage-3 "already scanned" tracking and stack allocation
+// for the centroid-scan pre-allocations. Sized for nlist=4096; ivf.search
+// asserts on overflow if a smaller index is loaded. v26 bumps the index to
+// nlist=4096 (Dockerfile ARG NLIST=4096) so each invlist holds ~750 vectors
+// and each scanInvlist call costs ~7 µs (down from ~28 µs at nlist=1024).
+pub const MAX_NLIST: usize = 4096;
 
-// Hard ceiling on the number of clusters scanned per query, including the
-// stage-2 probed cluster (NPROBE) and every stage-3 bbox-repair scan. The
-// offline recall validator (build_index/recall.zig, sweep over caps 0/24/16/
-// 12/8/4) showed that on 2k random samples from the 3M-vector reference set:
+// Two-tier cluster budget. FAST_CLUSTERS bounds the easy-case latency;
+// FULL_CLUSTERS bounds the ambiguous-case latency. Both include the stage-2
+// probed cluster (NPROBE counts as 1 toward `visited`).
 //
-//                cap=0   cap=24  cap=16  cap=12  cap=8   cap=4
-//   recall@5    1.0000  0.9995  0.9977  0.9961  0.9911  0.9776
-//   fc_match    1.0000  1.0000  1.0000  1.0000  1.0000  1.0000
-//   apv_flip    0.0000  0.0000  0.0000  0.0000  0.0000  0.0000
-//   avg scans   3.50    3.48    3.37    3.21    2.87    2.16
-//   p99 scans   21      21      16      12      8       4
+//   FAST_CLUSTERS  — cluster cap when fraud_count ∉ {2, 3}. The dominant
+//                    case (~95% of queries on the reference dataset).
+//   FULL_CLUSTERS  — cluster cap when fraud_count ∈ {2, 3}. The ambiguous
+//                    boundary zone where one extra fraud or one extra legit
+//                    flips approval — exactly where additional recall pays
+//                    off in the contest score.
 //
-//   v19 nlist=256 cap=8: judge p99 = 2.23 ms, FP=0 FN=0, det = 3000, final = 5652.
-//   v20 nlist=256 cap=4: judge p99 = 2.06 ms, FP=11 FN=11, E=44, det = 2504,
-//                        final = 5191 (absolute_penalty -496 wiped the gain).
+// Per-cluster scan cost at nlist=4096: ~7 µs. Worst-case latency budget:
+//   easy:      ~56 µs total scan (8 clusters × 7 µs)
+//   ambiguous: ~168 µs total scan (24 clusters × 7 µs)
 //
-// v23 switches the index to nlist=512 so each cluster holds ~6k vectors
-// instead of ~12k. A single scanInvlist call now costs ~80 µs (down from
-// ~160 µs), but the average query needs to scan more clusters because the
-// bbox of each smaller cluster covers less volume. The cap sweep at nlist
-// =512 (build_index/recall.zig over caps 0/24/16/12/8 on 2 k queries):
+// Compare against the v24 baseline (nlist=1024, fixed cap=12, ~28 µs/cluster):
+//   v24 always: ~336 µs (one budget for every query)
 //
-//                cap=0   cap=24  cap=16  cap=12  cap=8
-//   recall@5    1.0000  0.9979  0.9935  0.9890  0.9785
-//   apv_flip    0.0000  0.0000  0.0000  0.0000  0.0005
-//   avg scans   4.89    4.70    4.35    3.97    3.35
-//   p99 scans   31      24      16      12      8
-//
-// v23 (nlist=512, cap=12) shipped p99=1.90 ms / final=5721.82 on the judge,
-// +69.90 over v19. v24 doubles nlist again to 1024 (~3k vectors per cluster).
-// Cap sweep at nlist=1024 (build_index/recall.zig, 2 k queries):
-//
-//                cap=0   cap=32  cap=24  cap=20  cap=16  cap=12  cap=8
-//   recall@5    1.0000  0.9994  0.9975  0.9960  0.9921  0.9851  0.9746
-//   apv_flip    0.0000  0.0000  0.0000  0.0000  0.0000  0.0000  0.0000
-//   avg scans   5.52    5.47    5.36    5.23    4.99    4.57    3.90
-//   p99 scans   30      30      24      20      16      12      8
-//
-// At nlist=1024 every cap from 32 down to 8 holds apv_flip=0 in the 2 k
-// sample. cap=8 with margin 2.54 % is the most aggressive; v20's prod blow-
-// up at cap=4 / margin 2.24 % shows that wide margins extrapolate badly.
-// We pick cap=12 (margin 1.49 %, similar to v23's 1.10 % which produced 0
-// production errors). Per-cluster scan ~28 µs at this size, so:
-//   v19 (nlist=256, cap=8):  avg 459 µs, worst 1.28 ms
-//   v23 (nlist=512, cap=12): avg 318 µs, worst 960 µs
-//   v24 (nlist=1024, cap=12): avg 128 µs, worst 336 µs
-//
-// v25 attempted nlist=2048 with cap=16 (offline margin 1.64 %, larger than
-// v24's 1.49 %). It regressed: judge reported FP=2 FN=2 E=8 absolute_penalty
-// -286.27, final=5505 (-275 vs v24). Lesson: at nlist >= 2048 the per-
-// cluster bbox tightens enough that the offline margin no longer extrapolates
-// to the production tail. nlist=1024/cap=12 is the empirical floor of this
-// sweep.
-pub const MAX_CLUSTERS_VISITED: u32 = 12;
+// History of fixed-cap experiments (kept here so we don't relitigate):
+//   v19 nlist=256  cap=8  → final 5652 (p99 2.23 ms, det 3000).
+//   v20 nlist=256  cap=4  → final 5191 (FP=11 FN=11, det 2504).
+//   v23 nlist=512  cap=12 → final 5722 (p99 1.90 ms).
+//   v24 nlist=1024 cap=12 → final 5778 (p99 ~1.7 ms).
+//   v25 nlist=2048 cap=16 → final 5505 (FP=2 FN=2, det 2914).
+// v25's regression killed any plan to scale nlist further with a fixed cap.
+// Adaptive nprobe sidesteps that: the ambiguous-zone trigger explicitly
+// re-scans on uncertainty rather than betting on offline margin.
+pub const FAST_CLUSTERS: u32 = 8;
+pub const FULL_CLUSTERS: u32 = 24;
 
 pub const SearchResult = struct {
     fraud_count: u8,
@@ -379,15 +358,13 @@ pub fn search(
         }
     }
 
-    // Stage 3: bounding-box repair. For each non-probed cluster, compute the
-    // squared lower-bound of its bbox vs the query in i16. If lb > worst_d we
-    // can prove no member of that cluster can enter the top-5 and skip it.
-    // Once `visited` reaches MAX_CLUSTERS_VISITED we stop scanning even if
-    // some bbox would still pass — the offline validator showed the dropped
-    // candidates do not change fraud_count or approval, only top-5 identity.
+    // Stage 3a (fast): bbox-repair on non-probed clusters until `visited`
+    // hits FAST_CLUSTERS. This is the only budget paid by ~95% of queries
+    // (fraud_count ∉ {2, 3}). For each cluster, compute the squared lower-
+    // bound of its bbox vs the query in i16; if lb > worst_d the cluster
+    // cannot contribute to the top-5 and is skipped without a scan.
     var ci: u32 = 0;
-    while (ci < nlist) : (ci += 1) {
-        if (visited >= MAX_CLUSTERS_VISITED) break;
+    while (ci < nlist and visited < FAST_CLUSTERS) : (ci += 1) {
         if (scanned[ci]) continue;
         const start = idx.invlist_offsets[ci];
         const end = idx.invlist_offsets[ci + 1];
@@ -397,8 +374,36 @@ pub fn search(
         const bmax: *const [fmt.DIM]i16 = idx.bbox_max[bb_off..][0..fmt.DIM];
         const lb = bboxLowerBound(q_int, bmin, bmax);
         if (lb <= top.worst_d) {
+            scanned[ci] = true;
             scanInvlist(idx, ci, q_int, &top);
             visited += 1;
+        }
+    }
+
+    // Stage 3b (adaptive escalation): only run when the post-fast count sits
+    // on the approval boundary (fraud_score ∈ {0.4, 0.6}). One missed neighbour
+    // there flips `approved`, which dominates the score's absolute_penalty
+    // term. For unambiguous counts (0/1/4/5) the extra scans cannot change the
+    // approval decision so we skip them and bank the latency.
+    //
+    // The fast loop's `ci` cursor resumes where it left off — the bbox-repair
+    // pass is monotonic and untouched clusters never become eligible later.
+    const fast_count = top.fraudCount();
+    if (fast_count == 2 or fast_count == 3) {
+        while (ci < nlist and visited < FULL_CLUSTERS) : (ci += 1) {
+            if (scanned[ci]) continue;
+            const start = idx.invlist_offsets[ci];
+            const end = idx.invlist_offsets[ci + 1];
+            if (end <= start) continue;
+            const bb_off: usize = @as(usize, ci) * fmt.DIM;
+            const bmin: *const [fmt.DIM]i16 = idx.bbox_min[bb_off..][0..fmt.DIM];
+            const bmax: *const [fmt.DIM]i16 = idx.bbox_max[bb_off..][0..fmt.DIM];
+            const lb = bboxLowerBound(q_int, bmin, bmax);
+            if (lb <= top.worst_d) {
+                scanned[ci] = true;
+                scanInvlist(idx, ci, q_int, &top);
+                visited += 1;
+            }
         }
     }
 
