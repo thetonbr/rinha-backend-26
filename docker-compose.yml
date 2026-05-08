@@ -1,6 +1,7 @@
 services:
   api1:
     image: thetonbr/rinha-zig-2026:v24
+    cpuset: "0"
     environment:
       LISTEN_SOCKET_PATH: /sockets/api1.sock
     volumes:
@@ -21,6 +22,7 @@ services:
 
   api2:
     image: thetonbr/rinha-zig-2026:v24
+    cpuset: "1"
     environment:
       LISTEN_SOCKET_PATH: /sockets/api2.sock
     volumes:
@@ -41,6 +43,7 @@ services:
 
   lb:
     image: haproxy:2.9-alpine
+    cpuset: "2"
     volumes:
       - ./conf/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - sockets:/sockets:rw
